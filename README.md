@@ -1,7 +1,6 @@
 # intercom-mcp
 
-Message bus that lets agent sessions (Claude Code, Codex, or any MCP client) on the same
-machine talk to each other — ask questions, answer them, broadcast status.
+A coordination layer for AI agent fleets. An MCP server that lets agent sessions (Claude Code, Codex, or any MCP client) on one machine talk to each other: ask a question and block for the answer, fire-and-forget a message, broadcast status, and watch the whole fleet move in real time. No daemon, no port.
 
 ## How it works
 
@@ -29,24 +28,39 @@ Claude session C ── server.js ─┘
 | `inbox` | Fetch unread messages. `wait_seconds` long-polls until something arrives. |
 | `history` | Re-read recent traffic (optionally filtered to one agent). |
 
-## Waking idle sessions
+## Delivery & notifications
 
-Delivery is durable — anything you miss is in your `inbox` — but a session also
-gets **woken** when it can be, by either of two paths (`join` tells each session
-which one applies):
+Delivery is durable: anything you miss is waiting in your `inbox`. For real-time
+notification without polluting your session's transcript, arm a watcher:
 
-- **In tmux (zero setup):** each session records its `$TMUX` pane on `join`, so
-  when someone `send`s/`ask`s you, your intercom process types a one-line nudge
-  into your pane via `tmux send-keys`. An idle session wakes and checks inbox.
-  Verified end-to-end.
-- **Not in tmux:** run the watcher as a background shell or monitor —
-  `node wait.js --me <name>` — it prints one line and exits when you have mail,
-  which your harness turns into a wake (re-invokes the idle session to call
-  `inbox`). A child MCP can't push input into a non-tmux parent (OS limit), so
-  the session listens instead of being pushed to.
+- **Monitor (recommended):** run `monitor-watcher.js --me <name>` under your agent's
+  background-monitor mechanism. It emits one line per new message, so fresh mail
+  shows up as a clean event instead of being typed into your context.
+- **Status line:** `claude-code-statusline.js` puts an unread count in the status
+  bar, fully out of the way.
+- **Pull / blocking:** `inbox` long-polls (`wait_seconds`), and `ask` already blocks
+  until the other side `reply`s (~1s), so request/response needs no watcher at all.
 
-For pure request/response, `ask` already blocks until the other side `reply`s
-(within ~1s), so no waking is needed there.
+Broadcasts are pull-only by design: they don't nudge every session, so a busy fleet
+doesn't spam everyone. Directed messages are the ones that notify.
+
+## Watch the fleet
+
+`node watch.js` is a live, read-only dashboard of the bus: who's online, the recent
+message flow, and which questions are still open. It's how you actually see a fleet of
+agents coordinate. Add `--follow` to stream it. Example output:
+
+```
+┌─ Intercom Fleet Status
+├─ Online Agents (4)
+│   boss  ·  worker-2  ·  worker-3  ·  worker-4
+├─ Open Questions (1)
+│   #57 worker-2 → boss: "which lane owns the config file?"
+├─ Recent Message Flow
+│   #58 boss → worker-2   "take the parser lane, file-disjoint from w3"
+│   #59 worker-3 → boss   "lane done, 12/12 green"
+└─ (read-only; ^C to exit)
+```
 
 ## Ops
 
