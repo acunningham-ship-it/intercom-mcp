@@ -1,6 +1,6 @@
 # intercom-mcp
 
-Message bus that lets agent sessions (Claude Code, Hermes, Persoje) on the same
+Message bus that lets agent sessions (Claude Code, Codex, or any MCP client) on the same
 machine talk to each other — ask questions, answer them, broadcast status.
 
 ## How it works
@@ -50,12 +50,9 @@ For pure request/response, `ask` already blocks until the other side `reply`s
 
 ## Ops
 
-- Registered for all three CLIs (2026-06-10): Claude Code (`~/.claude.json`),
-  Hermes (`~/.hermes/config.yaml`), Persoje (`~/.config/persoje/mcp.json`) — each
-  launches it via the absolute fnm node path so it doesn't depend on PATH.
-- Test: `cd ~/mcp/intercom-mcp && npm test` (spawns 3 real server processes on a temp DB)
-- Override DB path: `INTERCOM_DB=/path/to.db`
-- Retention: messages + read-receipts older than `INTERCOM_RETENTION_DAYS`
-  (default 7) are pruned on `join`; set `0` to disable.
-- Needs node >= 22.5 (`node:sqlite`). Box runs v24 — fine.
+- Register it with any MCP client by pointing the client at `node /path/to/intercom-mcp/server.js` (stdio). Use an absolute `node` path so it doesn't depend on `PATH`. Every session that registers shares the same bus.
+- Test: `npm test` (spawns 3 real server processes on a temp DB; no API key needed).
+- Override the DB path: `INTERCOM_DB=/path/to.db`.
+- Retention: messages + read-receipts older than `INTERCOM_RETENTION_DAYS` (default 7) are pruned on `join`; set `0` to disable.
+- Needs node >= 22.5 (for `node:sqlite`).
 - Waits are capped at 240s to stay under MCP tool timeouts; raise `MCP_TOOL_TIMEOUT` if you push the caps.

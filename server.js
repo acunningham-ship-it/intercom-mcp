@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // intercom-mcp — inter-session message bus for agents on one box.
 //
-// Each agent session (Claude Code, Hermes, Persoje) spawns its own instance of
+// Each agent session (Claude Code, Codex, or any MCP client) spawns its own instance of
 // this stdio server; all instances share one SQLite database (WAL), so there is
 // no daemon and no port. Agents join with a name, then send/ask/reply/inbox
 // against the shared bus.
@@ -91,6 +91,9 @@ const TMUX_PANE = process.env.TMUX_PANE || null;
 
 // The tmux-free wake path: a background watcher the session arms on join.
 const WAIT_SCRIPT = pathJoin(import.meta.dirname, "wait.js");
+
+// Clean event-based notifications: Monitor script for message delivery.
+const MONITOR_SCRIPT = pathJoin(import.meta.dirname, "monitor-watcher.js");
 
 const now = () => new Date().toISOString();
 
@@ -256,13 +259,13 @@ const text = (s) => ({ content: [{ type: "text", text: s }] });
 const server = new McpServer(
   { name: "intercom", version: "0.1.0" },
   {
-    instructions: `Message bus between agent sessions (Claude Code, Hermes, Persoje) running on this machine.
+    instructions: `Message bus between agent sessions (Claude Code, Codex, or any MCP client) running on this machine.
 Start by calling join with a short descriptive name (e.g. the project you're working on).
 - send: fire-and-forget message to one agent or broadcast to all.
 - ask: send a question and BLOCK until the recipient replies (or timeout). The question stays queued if they're busy.
 - inbox: fetch your unread messages; pass wait_seconds to long-poll for new ones.
 - reply: answer a question or respond to a message by id.
-Waking: messaging a session wakes it if it can be woken — directly if it's in tmux, otherwise via the background watcher join tells you to arm. Delivery is durable either way: anything you miss is still in your inbox. If collaborating, also check inbox between tasks.`,
+Waking: on join, arm a Monitor for clean event-based notifications (call inbox when it fires). For tmux sessions, messaging wakes you instantly. Delivery is durable either way: anything you miss is still in your inbox. If collaborating, also check inbox between tasks.`,
   }
 );
 
@@ -290,11 +293,14 @@ server.tool(
           .join(", ")}`
       : `\nno other sessions online yet.`;
     if (unread) out += `\nyou have ${unread} unread message(s) — call inbox.`;
+    // Recommend the Monitor for clean event-based notifications
+    out += `\nnotifications (recommended): arm a Monitor for clean message delivery —`;
+    out += `\nMonitor(command="node ${MONITOR_SCRIPT} --me ${assigned}", persistent=true, description="intercom messages for ${assigned}")`;
+    out += `\nwhen it fires, call inbox to read. This gives you event-based notifications instead of pane injection.`;
     out += TMUX_PANE
-      ? `\nwake: you're in tmux — peers can wake you the moment they message you (no setup needed).`
-      : `\nwake (no tmux): to be nudged while idle, start this once as a background shell —` +
-        ` \`node ${WAIT_SCRIPT} --me ${assigned}\` — it prints a line and exits when you have` +
-        ` mail, and your harness re-invokes you to call inbox.`;
+      ? `\nalternatively (no setup): you're in tmux — peers can wake you instantly (no further setup needed).`
+      : `\nalternatively (no monitor): to be nudged while idle, start this once as a background shell —` +
+        ` \`node ${WAIT_SCRIPT} --me ${assigned}\` — it prints a line when you have mail.`;
     return text(out);
   }
 );

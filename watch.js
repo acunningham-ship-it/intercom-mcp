@@ -53,42 +53,63 @@ function closeDb() {
 }
 
 function getOnlineAgents() {
-  const rows = db.prepare("SELECT * FROM agents ORDER BY joined_at").all();
-  const online = [];
-  for (const a of rows) {
-    if (pidAlive(a.pid)) {
-      online.push(a);
+  try {
+    const rows = db.prepare("SELECT * FROM agents ORDER BY joined_at").all();
+    const online = [];
+    for (const a of rows) {
+      if (pidAlive(a.pid)) {
+        online.push(a);
+      }
     }
+    return online;
+  } catch (err) {
+    if (err.message.includes("no such table")) {
+      return []; // Bus not initialized yet
+    }
+    throw err;
   }
-  return online;
 }
 
 function getOpenAsks() {
-  // Questions without a corresponding answer
-  const questions = db
-    .prepare(`
-      SELECT m.id, m.from_agent, m.to_agent, m.body, m.created_at,
-             COUNT(a.id) as replied_count
-      FROM messages m
-      LEFT JOIN messages a ON a.reply_to = m.id AND a.kind = 'answer'
-      WHERE m.kind = 'question'
-      GROUP BY m.id
-      HAVING replied_count = 0
-      ORDER BY m.created_at DESC
-    `)
-    .all();
-  return questions;
+  try {
+    // Questions without a corresponding answer
+    const questions = db
+      .prepare(`
+        SELECT m.id, m.from_agent, m.to_agent, m.body, m.created_at,
+               COUNT(a.id) as replied_count
+        FROM messages m
+        LEFT JOIN messages a ON a.reply_to = m.id AND a.kind = 'answer'
+        WHERE m.kind = 'question'
+        GROUP BY m.id
+        HAVING replied_count = 0
+        ORDER BY m.created_at DESC
+      `)
+      .all();
+    return questions;
+  } catch (err) {
+    if (err.message.includes("no such table")) {
+      return []; // Bus not initialized yet
+    }
+    throw err;
+  }
 }
 
 function getRecentMessages(limit = 20) {
-  return db
-    .prepare(`
-      SELECT * FROM messages
-      ORDER BY id DESC
-      LIMIT ?
-    `)
-    .all(limit)
-    .reverse(); // show chronological order (oldest first)
+  try {
+    return db
+      .prepare(`
+        SELECT * FROM messages
+        ORDER BY id DESC
+        LIMIT ?
+      `)
+      .all(limit)
+      .reverse(); // show chronological order (oldest first)
+  } catch (err) {
+    if (err.message.includes("no such table")) {
+      return []; // Bus not initialized yet
+    }
+    throw err;
+  }
 }
 
 function formatOnlineAgents(agents) {
