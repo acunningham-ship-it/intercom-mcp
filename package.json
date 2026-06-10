@@ -6,7 +6,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node test/two-agents.test.js"
+    "test": "node test/two-agents.test.js && node test/watch.test.js && node test/v2-watchers.test.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
