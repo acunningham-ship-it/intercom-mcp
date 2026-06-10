@@ -229,12 +229,11 @@ function wake(targetName) {
 }
 
 // Wake every online agent except the sender; returns how many were nudged.
-function wakeOthers() {
-  let n = 0;
-  for (const a of onlineAgents()) {
-    if (a.name !== me && wake(a.name)) n++;
-  }
-  return n;
+// Wake other agents only for DIRECTED sends, not broadcasts.
+// Broadcasts are pull-only to avoid mass-injecting nudge lines into every pane.
+// Returns how many were nudged.
+function wakeDirected(targetName) {
+  return wake(targetName) ? 1 : 0;
 }
 
 function fmtMessage(m) {
@@ -337,11 +336,12 @@ server.tool(
       }
     }
     const id = insertMessage({ to, kind: "message", body: message });
-    const woke = to ? (wake(to) ? 1 : 0) : wakeOthers();
+    // Directed sends nudge the recipient; broadcasts are pull-only to avoid noise.
+    const woke = to ? wakeDirected(to) : 0;
     return text(
       `sent #${id} ${to ? `to ${to}` : "as broadcast"}.` +
         (woke
-          ? ` nudged ${woke} live session(s) to check inbox.`
+          ? ` nudged ${woke} session(s) to check inbox.`
           : ` they'll see it on their next inbox check.`)
     );
   }
@@ -376,8 +376,8 @@ server.tool(
       }
     }
     const qid = insertMessage({ to, kind: "question", body: question });
+    // Directed questions nudge the recipient; broadcast questions are pull-only.
     if (to) wake(to);
-    else wakeOthers();
     const deadline = Date.now() + timeout;
     while (Date.now() < deadline) {
       const answer = db
