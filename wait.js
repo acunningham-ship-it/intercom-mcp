@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// intercom wait — the tmux-free wake path.
+// intercom wait — the tmux-free wake path (v2).
 //
 // Long-polls the shared bus for messages addressed to --me and prints ONE line
 // when new mail arrives. Pair it with your harness's background-task / monitor:
@@ -9,6 +9,7 @@
 // --timeout seconds.
 //
 //   node wait.js --me <name> [--interval 2] [--once] [--timeout 0]
+//   node wait.js --me <name> --monitor       (emit one line per message, re-armable)
 //
 // Claude Code: run it as a background shell (one wake per mail, then re-arm), or
 // under a persistent monitor (one line per new message, stays armed).
@@ -27,54 +28,102 @@ const opt = (flag, def) => {
 const me = opt("--me", process.env.INTERCOM_NAME);
 if (!me) {
   console.error(
-    "usage: node wait.js --me <name> [--interval 2] [--once] [--timeout 0]"
+    "usage: node wait.js --me <name> [--interval 2] [--once] [--timeout 0] [--monitor]"
   );
   process.exit(2);
 }
 const interval = Math.max(1, Number(opt("--interval", 2))) * 1000;
 const once = args.includes("--once");
+const monitor = args.includes("--monitor");
 const timeoutMs = Number(opt("--timeout", 0)) * 1000; // 0 = run forever
 
 const DB_PATH =
   process.env.INTERCOM_DB ??
   pathJoin(homedir(), ".local", "share", "intercom", "intercom.db");
 
-const db = new DatabaseSync(DB_PATH);
-db.exec("PRAGMA busy_timeout = 5000;");
+let db = null;
+
+function openDb() {
+  try {
+    db = new DatabaseSync(DB_PATH);
+    db.exec("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL;");
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function closeDb() {
+  if (db) {
+    try {
+      db.close();
+    } catch {}
+    db = null;
+  }
+}
+
+if (!openDb()) {
+  console.error(`Cannot open ${DB_PATH}`);
+  process.exit(1);
+}
 
 // Same "unread for me" predicate the server uses for inbox.
-const q = db.prepare(
-  `SELECT m.id, m.from_agent, m.to_agent FROM messages m
-     WHERE m.from_agent != ?
-       AND (m.to_agent = ? OR m.to_agent IS NULL)
-       AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.agent = ? AND r.message_id = m.id)
-     ORDER BY m.id`
-);
+const getUnread = () => {
+  try {
+    return db.prepare(
+      `SELECT m.id, m.from_agent, m.to_agent FROM messages m
+         WHERE m.from_agent != ?
+           AND (m.to_agent = ? OR m.to_agent IS NULL)
+           AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.agent = ? AND r.message_id = m.id)
+         ORDER BY m.id`
+    ).all(me, me, me);
+  } catch {
+    // DB locked or tables not ready — return empty and retry next tick
+    return [];
+  }
+};
 
-for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => process.exit(0));
+for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => {
+  closeDb();
+  process.exit(0);
+});
 
 const announced = new Set(); // ids we've already emitted, so we don't repeat
 const start = Date.now();
 
 while (true) {
-  let rows = [];
-  try {
-    rows = q.all(me, me, me);
-  } catch {
-    // DB/tables not ready yet (no session has joined) — retry next tick.
-  }
+  const rows = getUnread();
   const fresh = rows.filter((r) => !announced.has(r.id));
+
   if (fresh.length) {
     for (const r of fresh) announced.add(r.id);
-    const parts = fresh
-      .map((r) => `${r.from_agent}${r.to_agent ? "" : "→all"} #${r.id}`)
-      .join(", ");
-    // One line = one wake event (batches cleanly under a monitor).
-    console.log(
-      `📨 intercom: ${fresh.length} new (${parts}) — call the intercom "inbox" tool to read.`
-    );
-    if (once) process.exit(0);
+
+    if (monitor) {
+      // Monitor mode: one line per message (re-armable)
+      for (const r of fresh) {
+        const target = r.to_agent ? `to ${r.to_agent}` : "broadcast";
+        console.log(`intercom: #${r.id} from ${r.from_agent} ${target}`);
+      }
+    } else {
+      // Background wake mode: batch all fresh into one line
+      const parts = fresh
+        .map((r) => `${r.from_agent}${r.to_agent ? "" : "→all"} #${r.id}`)
+        .join(", ");
+      console.log(
+        `[intercom] ${fresh.length} new message${fresh.length !== 1 ? "s" : ""}: ${parts} — call the intercom "inbox" tool to read.`
+      );
+    }
+
+    if (once) {
+      closeDb();
+      process.exit(0);
+    }
   }
-  if (timeoutMs && Date.now() - start >= timeoutMs) process.exit(0);
+
+  if (timeoutMs && Date.now() - start >= timeoutMs) {
+    closeDb();
+    process.exit(0);
+  }
+
   await sleep(interval);
 }
