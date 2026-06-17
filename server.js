@@ -576,17 +576,22 @@ server.tool(
     if (query) {
       // FTS5 search: find messages matching the query, filtered to those relevant to this session.
       // Relevant = messages I sent or received or broadcasts involving me.
-      const ftsMatches = db
-        .prepare(
-          `SELECT DISTINCT m.id FROM messages m
-           JOIN messages_fts fts ON m.id = fts.rowid
-           WHERE fts.body MATCH ?
-             AND (m.from_agent = ? OR m.to_agent = ? OR m.to_agent IS NULL)
-           ORDER BY fts.rank
-           LIMIT ?`
-        )
-        .all(query, me, me, limit ?? 30)
-        .map((r) => r.id);
+      // If 'with' is also specified, narrow results to that agent.
+      let sql = `SELECT DISTINCT m.id FROM messages m
+                 JOIN messages_fts fts ON m.id = fts.rowid
+                 WHERE fts.body MATCH ?
+                   AND (m.from_agent = ? OR m.to_agent = ? OR m.to_agent IS NULL)`;
+      const params = [query, me, me];
+
+      if (withAgent) {
+        sql += ` AND (m.from_agent = ? OR m.to_agent = ?)`;
+        params.push(withAgent, withAgent);
+      }
+
+      sql += ` ORDER BY fts.rank LIMIT ?`;
+      params.push(limit ?? 30);
+
+      const ftsMatches = db.prepare(sql).all(...params).map((r) => r.id);
 
       if (!ftsMatches.length) {
         return text(`no messages matching "${query}".`);
