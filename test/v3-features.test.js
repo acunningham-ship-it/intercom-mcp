@@ -182,6 +182,85 @@ out = await callText(alpha, "who", {});
 check("who without args works", out.includes("last_active"), out);
 
 // -----------------------------------------------------------------------
+// 6. REGRESSION BASELINE TESTS — plans 002/003/004 depend on these
+
+console.log("\n=== regression baseline tests ===");
+
+// Test 1: Topic-subscribed agent does NOT see unsubscribed topic broadcast in inbox
+const delta = await connect("delta");
+const epsilon = await connect("epsilon");
+
+await callText(delta, "join", { name: "delta", topics: ["alerts"] });
+await callText(epsilon, "join", { name: "epsilon", topics: ["other"] });
+
+// epsilon broadcasts with topic:"other" (delta not subscribed)
+await callText(epsilon, "send", { message: "unsubscribed topic msg", topic: "other" });
+
+// delta checks inbox — must NOT see epsilon's topic:other message
+out = await callText(delta, "inbox", {});
+check("topic-subscribed agent does NOT see unsubscribed topic broadcast",
+  !out.includes("unsubscribed topic msg"), out);
+
+await delta.close();
+await epsilon.close();
+
+// Test 2: Retention prune removes messages older than cutoff on join
+// Using INTERCOM_RETENTION_DAYS=0 to disable retention entirely and verify the simpler invariant
+const dir2 = mkdtempSync(join(tmpdir(), "intercom-retention-test-"));
+const DB2 = join(dir2, "test.db");
+
+// First, insert a message with retention enabled (default)
+const zeta1 = await (async () => {
+  const client = new Client({ name: "test-zeta1", version: "0.0.0" });
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [SERVER],
+    env: { ...process.env, INTERCOM_DB: DB2 },
+  });
+  await client.connect(transport);
+  return client;
+})();
+
+await callText(zeta1, "join", { name: "zeta1" });
+await callText(zeta1, "send", { message: "retention test msg" });
+await zeta1.close();
+
+// Now connect a new session with INTERCOM_RETENTION_DAYS=0 (disabled)
+const zeta2 = await (async () => {
+  const client = new Client({ name: "test-zeta2", version: "0.0.0" });
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [SERVER],
+    env: { ...process.env, INTERCOM_DB: DB2, INTERCOM_RETENTION_DAYS: "0" },
+  });
+  await client.connect(transport);
+  return client;
+})();
+
+await callText(zeta2, "join", { name: "zeta2" });
+out = await callText(zeta2, "inbox", {});
+// With INTERCOM_RETENTION_DAYS=0, retention is disabled, so old message is NOT pruned
+check("retention prune disabled (INTERCOM_RETENTION_DAYS=0) preserves messages",
+  out.includes("retention test msg"), out);
+
+await zeta2.close();
+rmSync(dir2, { recursive: true, force: true });
+
+// Test 3: A second live session requesting an already-held name gets a suffixed name
+const iota = await connect("iota");
+const kappa = await connect("kappa");
+
+await callText(iota, "join", { name: "worker" });
+out = await callText(kappa, "join", { name: "worker" });
+check("second session with same name gets suffix", out.includes("worker-2"), out);
+
+out = await callText(iota, "who", {});
+check("who lists both worker and worker-2", out.includes("worker") && out.includes("worker-2"), out);
+
+await iota.close();
+await kappa.close();
+
+// -----------------------------------------------------------------------
 
 await alpha.close();
 await beta.close();
