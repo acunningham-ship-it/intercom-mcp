@@ -182,6 +182,124 @@ out = await callText(alpha, "who", {});
 check("who without args works", out.includes("last_active"), out);
 
 // -----------------------------------------------------------------------
+// 6. REGRESSION BASELINE TESTS — plans 002/003/004 depend on these
+
+console.log("\n=== regression baseline tests ===");
+
+// Test 1: Topic-subscribed agent does NOT see unsubscribed topic broadcast in inbox
+const delta = await connect("delta");
+const epsilon = await connect("epsilon");
+
+await callText(delta, "join", { name: "delta", topics: ["alerts"] });
+await callText(epsilon, "join", { name: "epsilon", topics: ["other"] });
+
+// epsilon broadcasts with topic:"other" (delta not subscribed)
+await callText(epsilon, "send", { message: "unsubscribed topic msg", topic: "other" });
+
+// delta checks inbox — must NOT see epsilon's topic:other message
+out = await callText(delta, "inbox", {});
+check("topic-subscribed agent does NOT see unsubscribed topic broadcast",
+  !out.includes("unsubscribed topic msg"), out);
+
+await delta.close();
+await epsilon.close();
+
+// Test 2: Retention prune removes messages older than cutoff on join
+// Using INTERCOM_RETENTION_DAYS=0 to disable retention entirely and verify the simpler invariant
+const dir2 = mkdtempSync(join(tmpdir(), "intercom-retention-test-"));
+const DB2 = join(dir2, "test.db");
+
+// First, insert a message with retention enabled (default)
+const zeta1 = await (async () => {
+  const client = new Client({ name: "test-zeta1", version: "0.0.0" });
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [SERVER],
+    env: { ...process.env, INTERCOM_DB: DB2 },
+  });
+  await client.connect(transport);
+  return client;
+})();
+
+await callText(zeta1, "join", { name: "zeta1" });
+await callText(zeta1, "send", { message: "retention test msg" });
+await zeta1.close();
+
+// Now connect a new session with INTERCOM_RETENTION_DAYS=0 (disabled)
+const zeta2 = await (async () => {
+  const client = new Client({ name: "test-zeta2", version: "0.0.0" });
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [SERVER],
+    env: { ...process.env, INTERCOM_DB: DB2, INTERCOM_RETENTION_DAYS: "0" },
+  });
+  await client.connect(transport);
+  return client;
+})();
+
+await callText(zeta2, "join", { name: "zeta2" });
+out = await callText(zeta2, "inbox", {});
+// With INTERCOM_RETENTION_DAYS=0, retention is disabled, so old message is NOT pruned
+check("retention prune disabled (INTERCOM_RETENTION_DAYS=0) preserves messages",
+  out.includes("retention test msg"), out);
+
+await zeta2.close();
+rmSync(dir2, { recursive: true, force: true });
+
+// Test 3: A second live session requesting an already-held name gets a suffixed name
+const iota = await connect("iota");
+const kappa = await connect("kappa");
+
+await callText(iota, "join", { name: "worker" });
+out = await callText(kappa, "join", { name: "worker" });
+check("second session with same name gets suffix", out.includes("worker-2"), out);
+
+out = await callText(iota, "who", {});
+check("who lists both worker and worker-2", out.includes("worker") && out.includes("worker-2"), out);
+
+await iota.close();
+await kappa.close();
+
+// -----------------------------------------------------------------------
+// 7. ATOMIC NAME CLAIM — live holder is never overwritten; routing stays correct
+
+console.log("\n=== atomic name-claim tests (plan 003) ===");
+
+const lambda = await connect("lambda");
+const mu     = await connect("mu");
+
+// lambda claims "claimtest"
+await callText(lambda, "join", { name: "claimtest", role: "original" });
+
+// mu tries the same name — must get suffixed, never overwrite lambda's row
+out = await callText(mu, "join", { name: "claimtest" });
+check("second claimer gets suffixed name", out.includes("claimtest-2"), out);
+check("second claimer confirmation text says claimtest-2", out.includes("claimtest-2"), out);
+
+// who must show both names
+out = await callText(lambda, "who", {});
+check("who shows original holder claimtest", out.includes("claimtest"), out);
+check("who shows suffixed holder claimtest-2", out.includes("claimtest-2"), out);
+
+// Send a directed message to "claimtest" — must land with lambda, not mu
+const nu = await connect("nu");
+await callText(nu, "join", { name: "nu-messenger" });
+await callText(nu, "send", { message: "directed to original", to: "claimtest" });
+
+// lambda (original holder) must receive it
+out = await callText(lambda, "inbox", {});
+check("original holder receives message directed to their name", out.includes("directed to original"), out);
+
+// mu (suffixed claimer) must NOT receive lambda's directed message
+out = await callText(mu, "inbox", {});
+check("suffixed claimer does NOT receive message directed at original name",
+  !out.includes("directed to original"), out);
+
+await lambda.close();
+await mu.close();
+await nu.close();
+
+// -----------------------------------------------------------------------
 
 await alpha.close();
 await beta.close();

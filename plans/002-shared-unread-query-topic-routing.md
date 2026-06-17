@@ -6,7 +6,7 @@
 > done, update the status row for this plan in `plans/README.md` — unless a reviewer
 > dispatched you and told you they maintain the index.
 >
-> **Drift check (run first)**: `git diff --stat 24ead7d..HEAD -- server.js wait.js monitor-watcher.js`
+> **Drift check (run first)**: `git diff --stat 53b4bd5..HEAD -- server.js wait.js monitor-watcher.js`
 > If any in-scope file changed since this plan was written, compare the "Current state"
 > excerpts against the live code before proceeding; on a mismatch, treat it as a STOP
 > condition.
@@ -18,7 +18,7 @@
 - **Risk**: MED
 - **Depends on**: plans/001 (must be DONE — the baseline tests catch regressions here)
 - **Category**: bug / tech-debt
-- **Planned at**: commit `24ead7d`, 2026-06-17
+- **Planned at**: commit `53b4bd5`, 2026-06-17
 
 ## Why this matters
 

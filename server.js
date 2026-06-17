@@ -14,10 +14,11 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join as pathJoin } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import { unreadFor as unreadForShared } from "./unread.js";
 
 const DB_PATH =
   process.env.INTERCOM_DB ??
@@ -63,6 +64,7 @@ for (const col of [
   "tmux_socket TEXT",
   "tmux_pane TEXT",
   "topics TEXT",   // v2: JSON array of topic strings; NULL = receive all broadcasts
+  "pid_start TEXT", // v3: process start-time token from /proc/<pid>/stat field 22
 ]) {
   try { db.exec(`ALTER TABLE agents ADD COLUMN ${col}`); } catch {}
 }
@@ -101,6 +103,32 @@ function pidAlive(pid) {
   }
 }
 
+// Read process start-time from /proc/<pid>/stat field 22 (clock ticks since boot).
+// Returns null on any failure (non-Linux, missing proc, bad format).
+function processStartToken(pid) {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    // Field 22 is starttime; fields are space-separated but the process name
+    // (field 2) may contain spaces inside parens — find the closing paren first.
+    const closeParen = stat.lastIndexOf(")");
+    if (closeParen === -1) return null;
+    const fields = stat.slice(closeParen + 2).split(" ");
+    return fields[19] ?? null; // 0-indexed: field 22 is index 19 after the paren
+  } catch {
+    return null;
+  }
+}
+
+// An agent row is alive iff its PID is alive AND its start token matches (or
+// it has no stored token — backward-compat for rows written before this change).
+function agentAlive(row) {
+  if (!pidAlive(row.pid)) return false;
+  if (!row.pid_start) return true; // null/unknown → trust PID (backward-compat)
+  const current = processStartToken(row.pid);
+  if (current === null) return true; // can't read /proc → trust PID (safe fallback)
+  return current === row.pid_start;
+}
+
 function ago(iso) {
   const s = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
   if (s < 60) return `${Math.round(s)}s ago`;
@@ -122,43 +150,64 @@ function sanitizeName(name) {
 }
 
 function registerAs(rawName, role, topics) {
-  let name = sanitizeName(rawName);
-  if (!name) name = `agent-${process.pid}`;
-  // If the name is held by a different *live* process, suffix; a dead holder is replaced.
-  const holder = db
-    .prepare("SELECT pid FROM agents WHERE name = ?")
-    .get(name);
-  if (holder && holder.pid !== process.pid && pidAlive(holder.pid)) {
-    let i = 2;
-    while (true) {
-      const candidate = `${name}-${i}`;
-      const h = db.prepare("SELECT pid FROM agents WHERE name = ?").get(candidate);
-      if (!h || h.pid === process.pid || !pidAlive(h.pid)) {
-        name = candidate;
-        break;
-      }
-      i++;
-    }
-  }
-  const ts = now();
+  const baseName = sanitizeName(rawName) || `agent-${process.pid}`;
   // topics: null if not passed (COALESCE preserves existing); JSON string if provided.
   const topicsJson = Array.isArray(topics) ? JSON.stringify(topics) : null;
-  db.prepare(
-    `INSERT INTO agents (name, pid, cwd, role, joined_at, last_seen, tmux_socket, tmux_pane, topics)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(name) DO UPDATE SET
-       pid = excluded.pid, cwd = excluded.cwd,
-       role = COALESCE(excluded.role, agents.role),
-       last_seen = excluded.last_seen,
-       tmux_socket = excluded.tmux_socket, tmux_pane = excluded.tmux_pane,
-       topics = COALESCE(excluded.topics, agents.topics)`
-  ).run(name, process.pid, process.cwd(), role ?? null, ts, ts, null, null, topicsJson);
-  // Drop our previous name if we renamed mid-session.
-  if (me && me !== name) {
-    db.prepare("DELETE FROM agents WHERE name = ? AND pid = ?").run(me, process.pid);
+  // Wrap find-free-name + insert in a single IMMEDIATE transaction so two concurrent
+  // sessions racing on the same name can't both pass the "is it free?" check.
+  // Retry up to MAX_RETRIES suffix variants; final fallback is process-unique.
+  // pid_start (process start-time token) is captured so presence survives PID reuse.
+  const pidStart = processStartToken(process.pid);
+  const MAX_RETRIES = 50;
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const candidate =
+      attempt === 0            ? baseName
+      : attempt < MAX_RETRIES ? `${baseName}-${attempt + 1}`
+      :                         `${baseName}-${process.pid}`;
+
+    try {
+      db.exec("BEGIN IMMEDIATE");
+      const ts = now();
+      const holder = db
+        .prepare("SELECT pid FROM agents WHERE name = ?")
+        .get(candidate);
+
+      if (!holder) {
+        // Name is unclaimed — insert fresh.
+        db.prepare(
+          `INSERT INTO agents (name, pid, pid_start, cwd, role, joined_at, last_seen, tmux_socket, tmux_pane, topics)
+           VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)`
+        ).run(candidate, process.pid, pidStart, process.cwd(), role ?? null, ts, ts, topicsJson);
+        db.exec("COMMIT");
+      } else if (holder.pid === process.pid || !pidAlive(holder.pid)) {
+        // Same-process re-join or dead holder — update in place; preserve joined_at.
+        db.prepare(
+          `UPDATE agents SET pid = ?, pid_start = ?, cwd = ?, role = COALESCE(?, role),
+           last_seen = ?, tmux_socket = NULL, tmux_pane = NULL,
+           topics = COALESCE(?, topics) WHERE name = ?`
+        ).run(process.pid, pidStart, process.cwd(), role ?? null, ts, topicsJson, candidate);
+        db.exec("COMMIT");
+      } else {
+        // Live different-pid holder — cannot claim; suffix and retry.
+        db.exec("ROLLBACK");
+        continue;
+      }
+    } catch (err) {
+      try { db.exec("ROLLBACK"); } catch {}
+      throw err;
+    }
+
+    // Claimed successfully — drop our previous name if we renamed mid-session.
+    if (me && me !== candidate) {
+      db.prepare("DELETE FROM agents WHERE name = ? AND pid = ?").run(me, process.pid);
+    }
+    me = candidate;
+    return candidate;
   }
-  me = name;
-  return name;
+
+  // Unreachable: the process.pid fallback at attempt === MAX_RETRIES is always unique.
+  throw new Error("registerAs: exhausted all suffix attempts");
 }
 
 function ensureJoined() {
@@ -173,7 +222,7 @@ function onlineAgents() {
   const rows = db.prepare("SELECT * FROM agents ORDER BY joined_at").all();
   const online = [];
   for (const a of rows) {
-    if (pidAlive(a.pid)) online.push(a);
+    if (agentAlive(a)) online.push(a);
     else db.prepare("DELETE FROM agents WHERE name = ?").run(a.name);
   }
   return online;
@@ -201,31 +250,7 @@ function insertMessage({ to, kind, body, replyTo, topic }) {
 // filters.from  — only show messages from this agent name
 // filters.topic — only show messages tagged with this topic
 function unreadFor(agent, { from, topic } = {}) {
-  let sql = `SELECT m.* FROM messages m
-    WHERE m.from_agent != ?
-      AND (m.to_agent = ? OR m.to_agent IS NULL)
-      AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.agent = ? AND r.message_id = m.id)`;
-  const params = [agent, agent, agent];
-
-  if (from) { sql += ` AND m.from_agent = ?`; params.push(from); }
-  if (topic) { sql += ` AND m.topic = ?`; params.push(topic); }
-  sql += ` ORDER BY m.id`;
-
-  let msgs = db.prepare(sql).all(...params);
-
-  // Topic routing (JS layer): agents with a topics subscription only see topic-tagged
-  // broadcasts they subscribed to. topics=null = no subscription set = see all (backwards compat).
-  const agentRow = db.prepare("SELECT topics FROM agents WHERE name = ?").get(agent);
-  const myTopics = agentRow?.topics ? JSON.parse(agentRow.topics) : null;
-
-  if (myTopics !== null) {
-    msgs = msgs.filter((m) => {
-      if (m.to_agent || !m.topic) return true; // directed msg or non-topic broadcast: always show
-      return myTopics.includes(m.topic);        // topic broadcast: check subscription
-    });
-  }
-
-  return msgs;
+  return unreadForShared(db, agent, { from, topic });
 }
 
 function markRead(agent, ids) {
