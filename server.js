@@ -74,6 +74,21 @@ for (const col of [
   try { db.exec(`ALTER TABLE messages ADD COLUMN ${col}`); } catch {}
 }
 
+// FTS5 virtual table for full-text search over message bodies.
+// content= and content_rowid= make this a "contentless" FTS5 table that syncs with the messages table.
+// On startup, rebuild to ensure any backfilled rows are indexed.
+try {
+  db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+      body,
+      content='messages',
+      content_rowid='id'
+    );
+    INSERT INTO messages_fts(messages_fts) VALUES('rebuild');
+  `);
+} catch {}
+
+
 // Retention: drop messages (and their read-receipts) older than N days.
 const RETENTION_DAYS = Number(process.env.INTERCOM_RETENTION_DAYS ?? 7);
 function pruneOld() {
@@ -238,7 +253,18 @@ function insertMessage({ to, kind, body, replyTo, topic }) {
        VALUES (?, ?, ?, ?, ?, ?, ?)`
     )
     .run(me, to ?? null, kind, body, replyTo ?? null, now(), topic ?? null);
-  return Number(res.lastInsertRowid);
+
+  const msgId = Number(res.lastInsertRowid);
+
+  // Write-through to FTS5 table. Since we're using content= mode, this is optional
+  // (the FTS table auto-syncs), but explicit insert ensures immediate searchability.
+  try {
+    db.prepare(
+      `INSERT INTO messages_fts(rowid, body) VALUES (?, ?)`
+    ).run(msgId, body);
+  } catch {}
+
+  return msgId;
 }
 
 // unreadFor: returns unread messages for `agent`, applying topic routing + optional filters.
@@ -266,12 +292,14 @@ function markRead(agent, ids) {
 function fmtMessage(m) {
   const to = m.to_agent ? `to ${m.to_agent}` : "broadcast";
   const topicTag = m.topic ? ` [topic:${m.topic}]` : "";
-  let line = `[#${m.id}] ${m.from_agent} → ${to}${topicTag} (${m.kind}, ${ago(m.created_at)}): ${m.body}`;
+  const replyPrefix = m.reply_to ? `↩ #${m.reply_to} ` : "";
+  let line = `[#${m.id}] ${m.from_agent} → ${to}${topicTag} (${m.kind}, ${ago(m.created_at)}): ${replyPrefix}${m.body}`;
   if (m.kind === "question") {
     line += `\n      ↳ answer with reply(message_id: ${m.id}, message: "...")`;
   }
   if (m.kind === "answer" && m.reply_to) {
-    line = `[#${m.id}] ${m.from_agent} answered your question #${m.reply_to}${topicTag} (${ago(m.created_at)}): ${m.body}`;
+    // For answers, use the special format but preserve reply_to prefix if present.
+    line = `[#${m.id}] ${m.from_agent} answered your question ${replyPrefix}#${m.reply_to}${topicTag} (${ago(m.created_at)}): ${m.body}`;
   }
   return line;
 }
@@ -446,10 +474,20 @@ server.tool(
   "Reply to a message or answer a question by its #id (shown in inbox). The reply is delivered to the original sender.",
   {
     message_id: z.number().int().describe("The #id of the message you're replying to"),
-    message: z.string().describe("Your reply / answer"),
+    message: z.string().optional().describe("Your reply / answer"),
+    text: z.string().optional().describe("Alias for 'message' — your reply / answer"),
   },
-  async ({ message_id, message }) => {
+  async ({ message_id, message, text: textParam }) => {
     ensureJoined();
+
+    // Accept both 'message' and 'text' as the body param; 'text' is an alias.
+    const body = message ?? textParam;
+    if (!body) {
+      return text(
+        `reply requires either message or text param.\ncorrect signature: reply(message_id: <id>, message: "..." | text: "...")`
+      );
+    }
+
     const orig = db.prepare("SELECT * FROM messages WHERE id = ?").get(message_id);
     if (!orig) return text(`no message #${message_id} exists.`);
     if (orig.from_agent === me) return text(`message #${message_id} is your own — nothing to reply to.`);
@@ -457,7 +495,7 @@ server.tool(
     const id = insertMessage({
       to: orig.from_agent,
       kind,
-      body: message,
+      body,
       replyTo: message_id,
     });
     markRead(me, [message_id]);
@@ -526,11 +564,45 @@ server.tool(
       .optional()
       .describe("Only show traffic with this agent"),
     limit: z.number().int().min(1).max(200).optional().describe("Max messages (default 30)"),
+    query: z
+      .string()
+      .optional()
+      .describe("Full-text search query over message bodies (FTS5). Returns ranked results matching your query."),
   },
-  async ({ with: withAgent, limit }) => {
+  async ({ with: withAgent, limit, query }) => {
     ensureJoined();
     let rows;
-    if (withAgent) {
+
+    if (query) {
+      // FTS5 search: find messages matching the query, filtered to those relevant to this session.
+      // Relevant = messages I sent or received or broadcasts involving me.
+      // If 'with' is also specified, narrow results to that agent.
+      let sql = `SELECT DISTINCT m.id FROM messages m
+                 JOIN messages_fts fts ON m.id = fts.rowid
+                 WHERE fts.body MATCH ?
+                   AND (m.from_agent = ? OR m.to_agent = ? OR m.to_agent IS NULL)`;
+      const params = [query, me, me];
+
+      if (withAgent) {
+        sql += ` AND (m.from_agent = ? OR m.to_agent = ?)`;
+        params.push(withAgent, withAgent);
+      }
+
+      sql += ` ORDER BY fts.rank LIMIT ?`;
+      params.push(limit ?? 30);
+
+      const ftsMatches = db.prepare(sql).all(...params).map((r) => r.id);
+
+      if (!ftsMatches.length) {
+        return text(`no messages matching "${query}".`);
+      }
+
+      // Fetch full message rows in id order (not FTS rank order, for readability).
+      const placeholders = ftsMatches.map(() => "?").join(",");
+      rows = db
+        .prepare(`SELECT * FROM messages WHERE id IN (${placeholders}) ORDER BY id`)
+        .all(...ftsMatches);
+    } else if (withAgent) {
       rows = db
         .prepare(
           `SELECT * FROM messages
@@ -548,7 +620,8 @@ server.tool(
         )
         .all(me, me, limit ?? 30);
     }
-    if (!rows.length) return text("no traffic yet.");
+
+    if (!rows.length) return text(query ? `no messages matching "${query}".` : "no traffic yet.");
 
     // Annotate each message with read-state.
     const annotated = rows.reverse().map((m) => {
@@ -575,6 +648,68 @@ server.tool(
     });
 
     return text(annotated.join("\n"));
+  }
+);
+
+server.tool(
+  "thread",
+  "Walk the reply-to chain both ways (ancestors and descendants) and return the full conversation in order. Shows both directions of the thread starting from the given message.",
+  {
+    message_id: z.number().int().describe("The #id of any message in the thread"),
+  },
+  async ({ message_id }) => {
+    ensureJoined();
+
+    const msg = db.prepare("SELECT * FROM messages WHERE id = ?").get(message_id);
+    if (!msg) return text(`no message #${message_id} exists.`);
+
+    // Walk up to the root (follow reply_to chain).
+    let current = msg;
+    while (current.reply_to) {
+      current = db.prepare("SELECT * FROM messages WHERE id = ?").get(current.reply_to);
+      if (!current) break;
+    }
+    const root = current;
+
+    // Collect all messages in the thread by walking down from root.
+    const collected = new Set();
+    const allMessages = [];
+
+    function collectAll(msg) {
+      if (collected.has(msg.id)) return;
+      collected.add(msg.id);
+      allMessages.push(msg);
+
+      // Find all children of this message
+      const children = db
+        .prepare("SELECT * FROM messages WHERE reply_to = ? ORDER BY id")
+        .all(msg.id);
+      for (const child of children) {
+        collectAll(child);
+      }
+    }
+
+    collectAll(root);
+
+    // Sort by id to get chronological order
+    allMessages.sort((a, b) => a.id - b.id);
+
+    const lines = allMessages.map((m) => fmtMessage(m));
+    return text(`thread for #${message_id} (${allMessages.length} message${allMessages.length === 1 ? "" : "s"}):\n${lines.join("\n")}`);
+  }
+);
+
+server.tool(
+  "get_message",
+  "Fetch any message by id, regardless of read-state or direction. Useful for re-reading a broadcast or reviewing a specific message.",
+  {
+    message_id: z.number().int().describe("The #id of the message to fetch"),
+  },
+  async ({ message_id }) => {
+    ensureJoined();
+    const msg = db.prepare("SELECT * FROM messages WHERE id = ?").get(message_id);
+    if (!msg) return text(`no message #${message_id} exists.`);
+    return text(fmtMessage(msg));
   }
 );
 
