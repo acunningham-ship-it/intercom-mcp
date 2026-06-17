@@ -63,8 +63,9 @@ db.exec(`
 for (const col of [
   "tmux_socket TEXT",
   "tmux_pane TEXT",
-  "topics TEXT",   // v2: JSON array of topic strings; NULL = receive all broadcasts
+  "topics TEXT",    // v2: JSON array of topic strings; NULL = receive all broadcasts
   "pid_start TEXT", // v3: process start-time token from /proc/<pid>/stat field 22
+  "status TEXT",    // v3 Lane B: short status string set via update_status (e.g. "working", "done")
 ]) {
   try { db.exec(`ALTER TABLE agents ADD COLUMN ${col}`); } catch {}
 }
@@ -73,6 +74,21 @@ for (const col of [
 ]) {
   try { db.exec(`ALTER TABLE messages ADD COLUMN ${col}`); } catch {}
 }
+
+// FTS5 virtual table for full-text search over message bodies.
+// content= and content_rowid= make this a "contentless" FTS5 table that syncs with the messages table.
+// On startup, rebuild to ensure any backfilled rows are indexed.
+try {
+  db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+      body,
+      content='messages',
+      content_rowid='id'
+    );
+    INSERT INTO messages_fts(messages_fts) VALUES('rebuild');
+  `);
+} catch {}
+
 
 // Retention: drop messages (and their read-receipts) older than N days.
 const RETENTION_DAYS = Number(process.env.INTERCOM_RETENTION_DAYS ?? 7);
@@ -238,7 +254,18 @@ function insertMessage({ to, kind, body, replyTo, topic }) {
        VALUES (?, ?, ?, ?, ?, ?, ?)`
     )
     .run(me, to ?? null, kind, body, replyTo ?? null, now(), topic ?? null);
-  return Number(res.lastInsertRowid);
+
+  const msgId = Number(res.lastInsertRowid);
+
+  // Write-through to FTS5 table. Since we're using content= mode, this is optional
+  // (the FTS table auto-syncs), but explicit insert ensures immediate searchability.
+  try {
+    db.prepare(
+      `INSERT INTO messages_fts(rowid, body) VALUES (?, ?)`
+    ).run(msgId, body);
+  } catch {}
+
+  return msgId;
 }
 
 // unreadFor: returns unread messages for `agent`, applying topic routing + optional filters.
@@ -266,12 +293,14 @@ function markRead(agent, ids) {
 function fmtMessage(m) {
   const to = m.to_agent ? `to ${m.to_agent}` : "broadcast";
   const topicTag = m.topic ? ` [topic:${m.topic}]` : "";
-  let line = `[#${m.id}] ${m.from_agent} → ${to}${topicTag} (${m.kind}, ${ago(m.created_at)}): ${m.body}`;
+  const replyPrefix = m.reply_to ? `↩ #${m.reply_to} ` : "";
+  let line = `[#${m.id}] ${m.from_agent} → ${to}${topicTag} (${m.kind}, ${ago(m.created_at)}): ${replyPrefix}${m.body}`;
   if (m.kind === "question") {
     line += `\n      ↳ answer with reply(message_id: ${m.id}, message: "...")`;
   }
   if (m.kind === "answer" && m.reply_to) {
-    line = `[#${m.id}] ${m.from_agent} answered your question #${m.reply_to}${topicTag} (${ago(m.created_at)}): ${m.body}`;
+    // For answers, use the special format but preserve reply_to prefix if present.
+    line = `[#${m.id}] ${m.from_agent} answered your question ${replyPrefix}#${m.reply_to}${topicTag} (${ago(m.created_at)}): ${m.body}`;
   }
   return line;
 }
@@ -338,16 +367,25 @@ server.tool(
 
 server.tool(
   "who",
-  "List Claude Code sessions currently online on the intercom (name, role, cwd, last_active time, presence status: live/idle/stale).",
-  {},
-  async () => {
+  "List Claude Code sessions currently online on the intercom (name, role, status, cwd, last_active time, presence: live/idle/stale). Pass active_only to hide stale agents.",
+  {
+    active_only: z
+      .boolean()
+      .optional()
+      .describe("If true, only show live/idle agents (hide stale agents not seen in 5+ minutes)"),
+  },
+  async ({ active_only }) => {
     ensureJoined();
-    const agents = onlineAgents();
-    if (!agents.length) return text("nobody online (not even you — this shouldn't happen)");
+    let agents = onlineAgents();
+    if (active_only) agents = agents.filter((a) => statusLabel(a.last_seen) !== "stale");
+    if (!agents.length) {
+      return text(active_only ? "no active (live/idle) agents online." : "nobody online (not even you — this shouldn't happen)");
+    }
     const lines = agents.map((a) => {
-      const status = statusLabel(a.last_seen);
+      const presence = statusLabel(a.last_seen);
+      const statusStr = a.status ? ` status:${a.status}` : "";
       const topicsStr = a.topics ? ` topics:[${JSON.parse(a.topics).join(",")}]` : "";
-      return `- ${a.name}${a.name === me ? " (you)" : ""}${a.role ? ` — ${a.role}` : ""} · cwd ${a.cwd} · last_active ${ago(a.last_seen)} [${status}]${topicsStr}`;
+      return `- ${a.name}${a.name === me ? " (you)" : ""}${a.role ? ` — ${a.role}` : ""} · cwd ${a.cwd} · last_active ${ago(a.last_seen)} [${presence}]${statusStr}${topicsStr}`;
     });
     return text(lines.join("\n"));
   }
@@ -446,10 +484,20 @@ server.tool(
   "Reply to a message or answer a question by its #id (shown in inbox). The reply is delivered to the original sender.",
   {
     message_id: z.number().int().describe("The #id of the message you're replying to"),
-    message: z.string().describe("Your reply / answer"),
+    message: z.string().optional().describe("Your reply / answer"),
+    text: z.string().optional().describe("Alias for 'message' — your reply / answer"),
   },
-  async ({ message_id, message }) => {
+  async ({ message_id, message, text: textParam }) => {
     ensureJoined();
+
+    // Accept both 'message' and 'text' as the body param; 'text' is an alias.
+    const body = message ?? textParam;
+    if (!body) {
+      return text(
+        `reply requires either message or text param.\ncorrect signature: reply(message_id: <id>, message: "..." | text: "...")`
+      );
+    }
+
     const orig = db.prepare("SELECT * FROM messages WHERE id = ?").get(message_id);
     if (!orig) return text(`no message #${message_id} exists.`);
     if (orig.from_agent === me) return text(`message #${message_id} is your own — nothing to reply to.`);
@@ -457,7 +505,7 @@ server.tool(
     const id = insertMessage({
       to: orig.from_agent,
       kind,
-      body: message,
+      body,
       replyTo: message_id,
     });
     markRead(me, [message_id]);
@@ -471,7 +519,7 @@ server.tool(
 
 server.tool(
   "inbox",
-  "Fetch your unread messages (questions, answers, broadcasts). Pass wait_seconds to long-poll: blocks until a message arrives or the wait expires. Filter with from_agent or topic. Messages are marked read once fetched.",
+  "Fetch your unread messages (questions, answers, broadcasts). Pass wait_seconds to long-poll. Filter with from_agent, topic, or kind. Pass unread_count for a cheap count-only peek (messages stay unread). Messages are marked read once fetched (unless unread_count).",
   {
     wait_seconds: z
       .number()
@@ -488,20 +536,44 @@ server.tool(
       .string()
       .optional()
       .describe("Only show messages tagged with this topic"),
+    kind: z
+      .string()
+      .optional()
+      .describe("Only show messages of this kind: 'message', 'question', or 'answer'"),
+    unread_count: z
+      .boolean()
+      .optional()
+      .describe("If true, return just the integer count of unread messages — no bodies, no mark-as-read (cheap peek to decide whether to call inbox)"),
   },
-  async ({ wait_seconds, from_agent, topic }) => {
+  async ({ wait_seconds, from_agent, topic, kind, unread_count }) => {
     ensureJoined();
     const filters = { from: from_agent, topic };
+
+    // unread_count: non-destructive peek — count only, no mark-as-read, no waiting.
+    if (unread_count) {
+      let msgs = unreadFor(me, filters);
+      if (kind) msgs = msgs.filter((m) => m.kind === kind);
+      const filterDesc = [
+        from_agent && `from:${from_agent}`,
+        topic && `topic:${topic}`,
+        kind && `kind:${kind}`,
+      ].filter(Boolean).join(", ");
+      return text(`${msgs.length} unread${filterDesc ? ` (filter: ${filterDesc})` : ""}.`);
+    }
+
     const deadline = Date.now() + (wait_seconds ?? 0) * 1000;
     let msgs = unreadFor(me, filters);
+    if (kind) msgs = msgs.filter((m) => m.kind === kind);
     while (!msgs.length && Date.now() < deadline) {
       await sleep(400);
       msgs = unreadFor(me, filters);
+      if (kind) msgs = msgs.filter((m) => m.kind === kind);
     }
     if (!msgs.length) {
       const filterDesc = [
         from_agent && `from:${from_agent}`,
         topic && `topic:${topic}`,
+        kind && `kind:${kind}`,
       ].filter(Boolean).join(", ");
       return text(
         wait_seconds
@@ -526,11 +598,45 @@ server.tool(
       .optional()
       .describe("Only show traffic with this agent"),
     limit: z.number().int().min(1).max(200).optional().describe("Max messages (default 30)"),
+    query: z
+      .string()
+      .optional()
+      .describe("Full-text search query over message bodies (FTS5). Returns ranked results matching your query."),
   },
-  async ({ with: withAgent, limit }) => {
+  async ({ with: withAgent, limit, query }) => {
     ensureJoined();
     let rows;
-    if (withAgent) {
+
+    if (query) {
+      // FTS5 search: find messages matching the query, filtered to those relevant to this session.
+      // Relevant = messages I sent or received or broadcasts involving me.
+      // If 'with' is also specified, narrow results to that agent.
+      let sql = `SELECT DISTINCT m.id FROM messages m
+                 JOIN messages_fts fts ON m.id = fts.rowid
+                 WHERE fts.body MATCH ?
+                   AND (m.from_agent = ? OR m.to_agent = ? OR m.to_agent IS NULL)`;
+      const params = [query, me, me];
+
+      if (withAgent) {
+        sql += ` AND (m.from_agent = ? OR m.to_agent = ?)`;
+        params.push(withAgent, withAgent);
+      }
+
+      sql += ` ORDER BY fts.rank LIMIT ?`;
+      params.push(limit ?? 30);
+
+      const ftsMatches = db.prepare(sql).all(...params).map((r) => r.id);
+
+      if (!ftsMatches.length) {
+        return text(`no messages matching "${query}".`);
+      }
+
+      // Fetch full message rows in id order (not FTS rank order, for readability).
+      const placeholders = ftsMatches.map(() => "?").join(",");
+      rows = db
+        .prepare(`SELECT * FROM messages WHERE id IN (${placeholders}) ORDER BY id`)
+        .all(...ftsMatches);
+    } else if (withAgent) {
       rows = db
         .prepare(
           `SELECT * FROM messages
@@ -548,7 +654,8 @@ server.tool(
         )
         .all(me, me, limit ?? 30);
     }
-    if (!rows.length) return text("no traffic yet.");
+
+    if (!rows.length) return text(query ? `no messages matching "${query}".` : "no traffic yet.");
 
     // Annotate each message with read-state.
     const annotated = rows.reverse().map((m) => {
@@ -575,6 +682,136 @@ server.tool(
     });
 
     return text(annotated.join("\n"));
+  }
+);
+
+server.tool(
+  "thread",
+  "Walk the reply-to chain both ways (ancestors and descendants) and return the full conversation in order. Shows both directions of the thread starting from the given message.",
+  {
+    message_id: z.number().int().describe("The #id of any message in the thread"),
+  },
+  async ({ message_id }) => {
+    ensureJoined();
+
+    const msg = db.prepare("SELECT * FROM messages WHERE id = ?").get(message_id);
+    if (!msg) return text(`no message #${message_id} exists.`);
+
+    // Walk up to the root (follow reply_to chain).
+    let current = msg;
+    while (current.reply_to) {
+      current = db.prepare("SELECT * FROM messages WHERE id = ?").get(current.reply_to);
+      if (!current) break;
+    }
+    const root = current;
+
+    // Collect all messages in the thread by walking down from root.
+    const collected = new Set();
+    const allMessages = [];
+
+    function collectAll(msg) {
+      if (collected.has(msg.id)) return;
+      collected.add(msg.id);
+      allMessages.push(msg);
+
+      // Find all children of this message
+      const children = db
+        .prepare("SELECT * FROM messages WHERE reply_to = ? ORDER BY id")
+        .all(msg.id);
+      for (const child of children) {
+        collectAll(child);
+      }
+    }
+
+    collectAll(root);
+
+    // Sort by id to get chronological order
+    allMessages.sort((a, b) => a.id - b.id);
+
+    const lines = allMessages.map((m) => fmtMessage(m));
+    return text(`thread for #${message_id} (${allMessages.length} message${allMessages.length === 1 ? "" : "s"}):\n${lines.join("\n")}`);
+  }
+);
+
+server.tool(
+  "digest",
+  "Non-destructive catch-up summary of your unread messages: counts by kind plus one-line snippets for directed/question items. Messages stay unread — call inbox to actually read and mark them.",
+  {},
+  async () => {
+    ensureJoined();
+    const msgs = unreadFor(me);
+    if (!msgs.length) return text("no unread messages.");
+
+    // Classify each message into a display kind
+    function digestKind(m) {
+      if (m.kind === "question") return "question";
+      if (m.kind === "answer")   return "answer";
+      return m.to_agent ? "direct message" : "broadcast";
+    }
+
+    const counts = {};
+    for (const m of msgs) {
+      const k = digestKind(m);
+      counts[k] = (counts[k] ?? 0) + 1;
+    }
+    const countLine = Object.entries(counts)
+      .map(([k, n]) => `${n} ${k}${n !== 1 ? "s" : ""}`)
+      .join(", ");
+
+    // Notable: directed messages to me + any questions (may need a reply)
+    const notable = msgs.filter((m) => m.to_agent === me || m.kind === "question");
+    let out = `${msgs.length} unread: ${countLine}.`;
+    if (notable.length) {
+      out += `\n\ndirected/questions:`;
+      for (const m of notable) {
+        const snippet = m.body.length > 80 ? m.body.slice(0, 77) + "…" : m.body;
+        out += `\n  [#${m.id}] from:${m.from_agent} (${digestKind(m)}): ${snippet}`;
+      }
+    }
+    out += `\n\ncall inbox to read and mark as read.`;
+    return text(out);
+  }
+);
+
+server.tool(
+  "get_message",
+  "Fetch any message by id, regardless of read-state or direction. Useful for re-reading a broadcast or reviewing a specific message.",
+  {
+    message_id: z.number().int().describe("The #id of the message to fetch"),
+  },
+  async ({ message_id }) => {
+    ensureJoined();
+    const msg = db.prepare("SELECT * FROM messages WHERE id = ?").get(message_id);
+    if (!msg) return text(`no message #${message_id} exists.`);
+    return text(fmtMessage(msg));
+  }
+);
+
+server.tool(
+  "update_status",
+  "Update your status or role in-place without re-joining (no name conflict, no presence reset). Visible in who() so other agents know your current state.",
+  {
+    status: z
+      .string()
+      .optional()
+      .describe("Short status string, e.g. 'working', 'idle', 'done', 'blocked'"),
+    role: z
+      .string()
+      .optional()
+      .describe("Update your role text (what you're working on)"),
+  },
+  async ({ status, role }) => {
+    if (!me) return text("not joined — call join first.");
+    db.prepare(
+      `UPDATE agents SET status = COALESCE(?, status), role = COALESCE(?, role), last_seen = ? WHERE name = ?`
+    ).run(status ?? null, role ?? null, now(), me);
+    const row = db.prepare("SELECT status, role FROM agents WHERE name = ?").get(me);
+    let out = `updated ${me}:`;
+    if (status !== undefined) out += ` status=${status}`;
+    if (role !== undefined)   out += ` role=${role}`;
+    out += `.`;
+    if (row) out += ` (now: status=${row.status ?? "(none)"}, role=${row.role ?? "(none)"})`;
+    return text(out);
   }
 );
 

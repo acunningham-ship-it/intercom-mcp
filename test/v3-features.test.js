@@ -300,11 +300,298 @@ await mu.close();
 await nu.close();
 
 // -----------------------------------------------------------------------
+// 8. INBOX KIND FILTER + UNREAD_COUNT (Lane B)
+
+console.log("\n=== inbox kind filter + unread_count (Lane B) ===");
+
+const psi = await connect("psi");
+const chi = await connect("chi");
+await callText(psi, "join", { name: "psi" });
+await callText(chi, "join", { name: "chi" });
+await callText(chi, "inbox", {}); // drain any prior state
+
+// psi sends chi a regular message
+await callText(psi, "send", { message: "kind-test-message", to: "chi" });
+
+// unread_count: returns a count string without marking as read
+out = await callText(chi, "inbox", { unread_count: true });
+check("inbox unread_count returns count string", /^\d+ unread/.test(out), out);
+
+// messages are still unread after unread_count peek
+out = await callText(chi, "inbox", { kind: "message" });
+check("inbox kind=message returns message", out.includes("kind-test-message"), out);
+
+// send another message to test that kind filter leaves non-matching messages alone
+await callText(psi, "send", { message: "kind-test-leftover", to: "chi" });
+
+// kind=question filter when only regular messages exist → inbox empty
+out = await callText(chi, "inbox", { kind: "question" });
+check("inbox kind=question returns empty when no questions pending",
+  out.includes("inbox empty"), out);
+
+// the regular message is still unread (kind filter didn't consume it)
+out = await callText(chi, "inbox", {});
+check("kind-filtered messages stay unread for later plain fetch",
+  out.includes("kind-test-leftover"), out);
+
+// unread_count with kind filter
+await callText(psi, "send", { message: "another regular", to: "chi" });
+out = await callText(chi, "inbox", { unread_count: true, kind: "message" });
+check("inbox unread_count with kind filter returns count string", /^\d+ unread/.test(out), out);
+const countVal = parseInt(out.match(/^(\d+) unread/)?.[1] ?? "0");
+check("inbox unread_count kind=message count is >= 1", countVal >= 1, out);
+await callText(chi, "inbox", {}); // drain
+
+// -----------------------------------------------------------------------
+// 9. DIGEST TOOL (Lane B)
+
+console.log("\n=== digest tool (Lane B) ===");
+
+await callText(psi, "inbox", {}); // drain psi's inbox
+
+// chi sends psi a directed message + a broadcast
+await callText(chi, "send", { message: "directed to psi hello", to: "psi" });
+await callText(chi, "send", { message: "broadcast from chi" });
+
+// digest should report counts and show the directed item
+out = await callText(psi, "digest", {});
+check("digest returns unread count line", /\d+ unread/.test(out), out);
+check("digest shows directed item snippet", out.includes("directed to psi hello"), out);
+check("digest tells agent to call inbox to read", out.includes("inbox"), out);
+
+// digest is non-destructive — messages stay unread
+const countBeforeInbox = await callText(psi, "inbox", { unread_count: true });
+const stillUnread = parseInt(countBeforeInbox.match(/^(\d+) unread/)?.[1] ?? "0");
+check("digest does not mark messages as read (count >= 1 after digest)", stillUnread >= 1, countBeforeInbox);
+
+// calling inbox after digest delivers messages normally
+out = await callText(psi, "inbox", {});
+check("inbox after digest delivers messages", out.includes("directed to psi hello"), out);
+
+// -----------------------------------------------------------------------
+// 10. UPDATE_STATUS TOOL (Lane B)
+
+console.log("\n=== update_status tool (Lane B) ===");
+
+// psi updates its status
+out = await callText(psi, "update_status", { status: "working" });
+check("update_status returns confirmation", out.includes("working"), out);
+
+// who (from chi's view) should show status for psi
+out = await callText(chi, "who", {});
+check("who shows status field after update_status", out.includes("working"), out);
+
+// update role separately without touching status
+out = await callText(psi, "update_status", { role: "lane-b-testing" });
+check("update_status can update role alone", out.includes("lane-b-testing"), out);
+
+// status should still be "working" (not clobbered)
+out = await callText(chi, "who", {});
+check("update_status role-only update preserves existing status",
+  out.includes("working"), out);
+check("who shows updated role after update_status role-only",
+  out.includes("lane-b-testing"), out);
+
+// update to a new status
+out = await callText(psi, "update_status", { status: "done" });
+check("update_status can change status to done", out.includes("done"), out);
+
+// -----------------------------------------------------------------------
+// 11. WHO ACTIVE_ONLY + STATUS FIELD (Lane B)
+
+console.log("\n=== who active_only + status field (Lane B) ===");
+
+// without active_only, both psi and chi appear
+out = await callText(chi, "who", {});
+check("who without active_only shows live agents", out.includes("psi") || out.includes("chi"), out);
+
+// active_only=false behaves same as default
+out = await callText(chi, "who", { active_only: false });
+check("who active_only=false is same as default", out.includes("psi") || out.includes("chi"), out);
+
+// active_only=true still shows freshly-active agents (psi and chi just made tool calls)
+out = await callText(chi, "who", { active_only: true });
+check("who active_only=true includes recently-active agents",
+  out.includes("psi") || out.includes("chi"), out);
+
+// status field is visible in who output (psi has status=done from test 10)
+out = await callText(chi, "who", {});
+check("who surfaces status field for agents that set it",
+  out.includes("status:done") || out.includes("done"), out);
+
+await psi.close();
+await chi.close();
+
+// -----------------------------------------------------------------------
 
 await alpha.close();
 await beta.close();
 await gamma.close();
 rmSync(dir, { recursive: true, force: true });
+
+// -----------------------------------------------------------------------
+// Lane A: THREADING, GET_MESSAGE, REPLY ALIAS, FTS SEARCH
+
+console.log("\n=== Lane A: threading + get_message + reply alias + FTS search ===");
+
+const alice = await connect("alice");
+const bob   = await connect("bob");
+
+await callText(alice, "join", { name: "alice" });
+await callText(bob,   "join", { name: "bob" });
+
+// 1. THREADING — reply_to chain and thread tool
+
+console.log("\n--- test: threading ---");
+
+// alice asks bob a question
+const askResp = await callText(alice, "ask", {
+  question: "what is the answer to life?",
+  to: "bob",
+  timeout_seconds: 1,
+});
+// Extract the message ID from "question #X"
+const q1 = askResp.match(/question #(\d+)/)?.[1];
+check("ask returns message id in response", !!q1, `q1=${q1}, response=${askResp}`);
+
+// bob replies with an answer
+let result = await callText(bob, "inbox", {});
+check("bob sees the question", result.includes("what is the answer to life?"), result);
+
+const aId = result.match(/#(\d+)\]/)?.[1];
+check("inbox shows question with #id", !!aId, `aId=${aId}`);
+
+const replyResp = await callText(bob, "reply", { message_id: parseInt(aId), message: "42" });
+// Extract from "replied to #X with #Y" → extract the last match
+const a1Match = replyResp.match(/with #(\d+)/);
+const a1 = a1Match ? a1Match[1] : replyResp.match(/#(\d+)/)?.[1];
+check("reply returns answer message id", !!a1, `a1=${a1}, response=${replyResp}`);
+
+// alice reads the answer
+result = await callText(alice, "inbox", {});
+check("alice receives answer", result.includes("42"), result);
+check("answer shows reply_to prefix", result.includes("↩"), result);
+
+// 2. GET_MESSAGE — fetch any message by id
+
+console.log("\n--- test: get_message ---");
+
+result = await callText(bob, "get_message", { message_id: parseInt(q1) });
+check("get_message retrieves question", result.includes("what is the answer to life?"), result);
+
+result = await callText(alice, "get_message", { message_id: parseInt(a1) });
+check("get_message retrieves answer", result.includes("42"), result);
+
+// 3. REPLY ALIAS — both 'message' and 'text' params work
+
+console.log("\n--- test: reply alias (text → message) ---");
+
+// bob sends a message to alice
+const sendResp = await callText(bob, "send", { message: "hello alice", to: "alice" });
+const b1 = sendResp.match(/sent #(\d+)/)?.[1];
+check("send returns message id", !!b1, `b1=${b1}, response=${sendResp}`);
+
+await callText(alice, "inbox", {});
+
+// alice replies using the 'text' param instead of 'message'
+const replyResp2 = await callText(alice, "reply", { message_id: parseInt(b1), text: "hello back" });
+check("reply with 'text' param works", replyResp2.includes("replied to"), replyResp2);
+check("reply with 'text' param shows reply id", replyResp2.includes("#"), replyResp2);
+
+// bob reads it
+result = await callText(bob, "inbox", {});
+check("bob receives reply sent via 'text' param", result.includes("hello back"), result);
+
+// 4. REPLY WITHOUT PARAMS — should error with correct signature
+
+console.log("\n--- test: reply error handling ---");
+
+result = await callText(alice, "reply", { message_id: parseInt(b1) });
+check("reply without message/text shows error", result.includes("reply requires"), result);
+check("reply error shows correct signature", result.includes("message_id") && result.includes("message"), result);
+
+// 5. THREAD TOOL — walk ancestors and descendants
+
+console.log("\n--- test: thread tool ---");
+
+// set up a longer conversation: alice -> bob -> alice -> bob
+const sendResp1 = await callText(alice, "send", {
+  message: "first question",
+  to: "bob"
+});
+const firstQ = sendResp1.match(/sent #(\d+)/)?.[1];
+await callText(bob, "inbox", {});
+
+const replyResp1 = await callText(bob, "reply", {
+  message_id: parseInt(firstQ),
+  message: "first answer"
+});
+const firstA = replyResp1.match(/with #(\d+)/)?.[1];
+await callText(alice, "inbox", {});
+
+const replyResp2q = await callText(alice, "reply", {
+  message_id: parseInt(firstA),
+  message: "follow up question"
+});
+const secondQ = replyResp2q.match(/with #(\d+)/)?.[1];
+await callText(bob, "inbox", {});
+
+const replyResp2a = await callText(bob, "reply", {
+  message_id: parseInt(secondQ),
+  message: "follow up answer"
+});
+const secondA = replyResp2a.match(/with #(\d+)/)?.[1];
+await callText(alice, "inbox", {});
+
+// now call thread from the middle — should see the whole chain
+result = await callText(alice, "thread", { message_id: parseInt(firstA) });
+check("thread shows ancestors", result.includes("first question"), result);
+check("thread shows descendants", result.includes("follow up answer"), result);
+check("thread shows root message", result.includes("first answer"), result);
+check("thread shows message count", result.includes("4 message"), result);
+
+// thread from the last message in chain
+result = await callText(bob, "thread", { message_id: parseInt(secondA) });
+check("thread from leaf includes all ancestors",
+  result.includes("first question") && result.includes("first answer") && result.includes("follow up question"),
+  result);
+
+// 6. FTS SEARCH — history with query param
+
+console.log("\n--- test: FTS search via history query ---");
+
+// insert some messages with different content
+await callText(alice, "send", { message: "urgent security alert", to: "bob" });
+await callText(alice, "send", { message: "normal status update", to: "bob" });
+await callText(alice, "send", { message: "critical bug found", to: "bob" });
+
+// search for "urgent"
+result = await callText(alice, "history", { query: "urgent" });
+check("FTS query finds 'urgent'", result.includes("urgent security alert"), result);
+check("FTS query excludes non-matching", !result.includes("normal status"), result);
+
+// search for "critical"
+result = await callText(alice, "history", { query: "critical" });
+check("FTS query finds 'critical'", result.includes("critical bug"), result);
+
+// search for non-existent term
+result = await callText(alice, "history", { query: "nonexistent" });
+check("FTS query returns no results for non-matching term", result.includes("no messages matching"), result);
+
+// search combining with with= param (search within a conversation)
+result = await callText(alice, "history", { with: "bob", query: "status" });
+check("FTS query with 'with' filters results", result.includes("normal status update"), result);
+
+// 7. FMTMESSAGE REPLY PREFIX — all formatted output includes reply_to prefix
+
+console.log("\n--- test: fmtMessage reply_to prefix ---");
+
+result = await callText(alice, "get_message", { message_id: parseInt(secondQ) });
+check("formatted reply shows ↩ prefix", result.includes("↩"), result);
+check("formatted reply shows reference id", result.includes(`#${firstA}`), result);
+
+await alice.close();
+await bob.close();
 
 if (failed) {
   console.error(`\n${failed} check(s) failed`);
