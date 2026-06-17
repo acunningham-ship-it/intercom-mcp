@@ -300,6 +300,129 @@ await mu.close();
 await nu.close();
 
 // -----------------------------------------------------------------------
+// 8. INBOX KIND FILTER + UNREAD_COUNT (Lane B)
+
+console.log("\n=== inbox kind filter + unread_count (Lane B) ===");
+
+const psi = await connect("psi");
+const chi = await connect("chi");
+await callText(psi, "join", { name: "psi" });
+await callText(chi, "join", { name: "chi" });
+await callText(chi, "inbox", {}); // drain any prior state
+
+// psi sends chi a regular message
+await callText(psi, "send", { message: "kind-test-message", to: "chi" });
+
+// unread_count: returns a count string without marking as read
+out = await callText(chi, "inbox", { unread_count: true });
+check("inbox unread_count returns count string", /^\d+ unread/.test(out), out);
+
+// messages are still unread after unread_count peek
+out = await callText(chi, "inbox", { kind: "message" });
+check("inbox kind=message returns message", out.includes("kind-test-message"), out);
+
+// send another message to test that kind filter leaves non-matching messages alone
+await callText(psi, "send", { message: "kind-test-leftover", to: "chi" });
+
+// kind=question filter when only regular messages exist → inbox empty
+out = await callText(chi, "inbox", { kind: "question" });
+check("inbox kind=question returns empty when no questions pending",
+  out.includes("inbox empty"), out);
+
+// the regular message is still unread (kind filter didn't consume it)
+out = await callText(chi, "inbox", {});
+check("kind-filtered messages stay unread for later plain fetch",
+  out.includes("kind-test-leftover"), out);
+
+// unread_count with kind filter
+await callText(psi, "send", { message: "another regular", to: "chi" });
+out = await callText(chi, "inbox", { unread_count: true, kind: "message" });
+check("inbox unread_count with kind filter returns count string", /^\d+ unread/.test(out), out);
+const countVal = parseInt(out.match(/^(\d+) unread/)?.[1] ?? "0");
+check("inbox unread_count kind=message count is >= 1", countVal >= 1, out);
+await callText(chi, "inbox", {}); // drain
+
+// -----------------------------------------------------------------------
+// 9. DIGEST TOOL (Lane B)
+
+console.log("\n=== digest tool (Lane B) ===");
+
+await callText(psi, "inbox", {}); // drain psi's inbox
+
+// chi sends psi a directed message + a broadcast
+await callText(chi, "send", { message: "directed to psi hello", to: "psi" });
+await callText(chi, "send", { message: "broadcast from chi" });
+
+// digest should report counts and show the directed item
+out = await callText(psi, "digest", {});
+check("digest returns unread count line", /\d+ unread/.test(out), out);
+check("digest shows directed item snippet", out.includes("directed to psi hello"), out);
+check("digest tells agent to call inbox to read", out.includes("inbox"), out);
+
+// digest is non-destructive — messages stay unread
+const countBeforeInbox = await callText(psi, "inbox", { unread_count: true });
+const stillUnread = parseInt(countBeforeInbox.match(/^(\d+) unread/)?.[1] ?? "0");
+check("digest does not mark messages as read (count >= 1 after digest)", stillUnread >= 1, countBeforeInbox);
+
+// calling inbox after digest delivers messages normally
+out = await callText(psi, "inbox", {});
+check("inbox after digest delivers messages", out.includes("directed to psi hello"), out);
+
+// -----------------------------------------------------------------------
+// 10. UPDATE_STATUS TOOL (Lane B)
+
+console.log("\n=== update_status tool (Lane B) ===");
+
+// psi updates its status
+out = await callText(psi, "update_status", { status: "working" });
+check("update_status returns confirmation", out.includes("working"), out);
+
+// who (from chi's view) should show status for psi
+out = await callText(chi, "who", {});
+check("who shows status field after update_status", out.includes("working"), out);
+
+// update role separately without touching status
+out = await callText(psi, "update_status", { role: "lane-b-testing" });
+check("update_status can update role alone", out.includes("lane-b-testing"), out);
+
+// status should still be "working" (not clobbered)
+out = await callText(chi, "who", {});
+check("update_status role-only update preserves existing status",
+  out.includes("working"), out);
+check("who shows updated role after update_status role-only",
+  out.includes("lane-b-testing"), out);
+
+// update to a new status
+out = await callText(psi, "update_status", { status: "done" });
+check("update_status can change status to done", out.includes("done"), out);
+
+// -----------------------------------------------------------------------
+// 11. WHO ACTIVE_ONLY + STATUS FIELD (Lane B)
+
+console.log("\n=== who active_only + status field (Lane B) ===");
+
+// without active_only, both psi and chi appear
+out = await callText(chi, "who", {});
+check("who without active_only shows live agents", out.includes("psi") || out.includes("chi"), out);
+
+// active_only=false behaves same as default
+out = await callText(chi, "who", { active_only: false });
+check("who active_only=false is same as default", out.includes("psi") || out.includes("chi"), out);
+
+// active_only=true still shows freshly-active agents (psi and chi just made tool calls)
+out = await callText(chi, "who", { active_only: true });
+check("who active_only=true includes recently-active agents",
+  out.includes("psi") || out.includes("chi"), out);
+
+// status field is visible in who output (psi has status=done from test 10)
+out = await callText(chi, "who", {});
+check("who surfaces status field for agents that set it",
+  out.includes("status:done") || out.includes("done"), out);
+
+await psi.close();
+await chi.close();
+
+// -----------------------------------------------------------------------
 
 await alpha.close();
 await beta.close();

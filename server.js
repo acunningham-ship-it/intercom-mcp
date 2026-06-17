@@ -63,8 +63,9 @@ db.exec(`
 for (const col of [
   "tmux_socket TEXT",
   "tmux_pane TEXT",
-  "topics TEXT",   // v2: JSON array of topic strings; NULL = receive all broadcasts
+  "topics TEXT",    // v2: JSON array of topic strings; NULL = receive all broadcasts
   "pid_start TEXT", // v3: process start-time token from /proc/<pid>/stat field 22
+  "status TEXT",    // v3 Lane B: short status string set via update_status (e.g. "working", "done")
 ]) {
   try { db.exec(`ALTER TABLE agents ADD COLUMN ${col}`); } catch {}
 }
@@ -338,16 +339,25 @@ server.tool(
 
 server.tool(
   "who",
-  "List Claude Code sessions currently online on the intercom (name, role, cwd, last_active time, presence status: live/idle/stale).",
-  {},
-  async () => {
+  "List Claude Code sessions currently online on the intercom (name, role, status, cwd, last_active time, presence: live/idle/stale). Pass active_only to hide stale agents.",
+  {
+    active_only: z
+      .boolean()
+      .optional()
+      .describe("If true, only show live/idle agents (hide stale agents not seen in 5+ minutes)"),
+  },
+  async ({ active_only }) => {
     ensureJoined();
-    const agents = onlineAgents();
-    if (!agents.length) return text("nobody online (not even you — this shouldn't happen)");
+    let agents = onlineAgents();
+    if (active_only) agents = agents.filter((a) => statusLabel(a.last_seen) !== "stale");
+    if (!agents.length) {
+      return text(active_only ? "no active (live/idle) agents online." : "nobody online (not even you — this shouldn't happen)");
+    }
     const lines = agents.map((a) => {
-      const status = statusLabel(a.last_seen);
+      const presence = statusLabel(a.last_seen);
+      const statusStr = a.status ? ` status:${a.status}` : "";
       const topicsStr = a.topics ? ` topics:[${JSON.parse(a.topics).join(",")}]` : "";
-      return `- ${a.name}${a.name === me ? " (you)" : ""}${a.role ? ` — ${a.role}` : ""} · cwd ${a.cwd} · last_active ${ago(a.last_seen)} [${status}]${topicsStr}`;
+      return `- ${a.name}${a.name === me ? " (you)" : ""}${a.role ? ` — ${a.role}` : ""} · cwd ${a.cwd} · last_active ${ago(a.last_seen)} [${presence}]${statusStr}${topicsStr}`;
     });
     return text(lines.join("\n"));
   }
@@ -471,7 +481,7 @@ server.tool(
 
 server.tool(
   "inbox",
-  "Fetch your unread messages (questions, answers, broadcasts). Pass wait_seconds to long-poll: blocks until a message arrives or the wait expires. Filter with from_agent or topic. Messages are marked read once fetched.",
+  "Fetch your unread messages (questions, answers, broadcasts). Pass wait_seconds to long-poll. Filter with from_agent, topic, or kind. Pass unread_count for a cheap count-only peek (messages stay unread). Messages are marked read once fetched (unless unread_count).",
   {
     wait_seconds: z
       .number()
@@ -488,20 +498,44 @@ server.tool(
       .string()
       .optional()
       .describe("Only show messages tagged with this topic"),
+    kind: z
+      .string()
+      .optional()
+      .describe("Only show messages of this kind: 'message', 'question', or 'answer'"),
+    unread_count: z
+      .boolean()
+      .optional()
+      .describe("If true, return just the integer count of unread messages — no bodies, no mark-as-read (cheap peek to decide whether to call inbox)"),
   },
-  async ({ wait_seconds, from_agent, topic }) => {
+  async ({ wait_seconds, from_agent, topic, kind, unread_count }) => {
     ensureJoined();
     const filters = { from: from_agent, topic };
+
+    // unread_count: non-destructive peek — count only, no mark-as-read, no waiting.
+    if (unread_count) {
+      let msgs = unreadFor(me, filters);
+      if (kind) msgs = msgs.filter((m) => m.kind === kind);
+      const filterDesc = [
+        from_agent && `from:${from_agent}`,
+        topic && `topic:${topic}`,
+        kind && `kind:${kind}`,
+      ].filter(Boolean).join(", ");
+      return text(`${msgs.length} unread${filterDesc ? ` (filter: ${filterDesc})` : ""}.`);
+    }
+
     const deadline = Date.now() + (wait_seconds ?? 0) * 1000;
     let msgs = unreadFor(me, filters);
+    if (kind) msgs = msgs.filter((m) => m.kind === kind);
     while (!msgs.length && Date.now() < deadline) {
       await sleep(400);
       msgs = unreadFor(me, filters);
+      if (kind) msgs = msgs.filter((m) => m.kind === kind);
     }
     if (!msgs.length) {
       const filterDesc = [
         from_agent && `from:${from_agent}`,
         topic && `topic:${topic}`,
+        kind && `kind:${kind}`,
       ].filter(Boolean).join(", ");
       return text(
         wait_seconds
@@ -575,6 +609,74 @@ server.tool(
     });
 
     return text(annotated.join("\n"));
+  }
+);
+
+server.tool(
+  "digest",
+  "Non-destructive catch-up summary of your unread messages: counts by kind plus one-line snippets for directed/question items. Messages stay unread — call inbox to actually read and mark them.",
+  {},
+  async () => {
+    ensureJoined();
+    const msgs = unreadFor(me);
+    if (!msgs.length) return text("no unread messages.");
+
+    // Classify each message into a display kind
+    function digestKind(m) {
+      if (m.kind === "question") return "question";
+      if (m.kind === "answer")   return "answer";
+      return m.to_agent ? "direct message" : "broadcast";
+    }
+
+    const counts = {};
+    for (const m of msgs) {
+      const k = digestKind(m);
+      counts[k] = (counts[k] ?? 0) + 1;
+    }
+    const countLine = Object.entries(counts)
+      .map(([k, n]) => `${n} ${k}${n !== 1 ? "s" : ""}`)
+      .join(", ");
+
+    // Notable: directed messages to me + any questions (may need a reply)
+    const notable = msgs.filter((m) => m.to_agent === me || m.kind === "question");
+    let out = `${msgs.length} unread: ${countLine}.`;
+    if (notable.length) {
+      out += `\n\ndirected/questions:`;
+      for (const m of notable) {
+        const snippet = m.body.length > 80 ? m.body.slice(0, 77) + "…" : m.body;
+        out += `\n  [#${m.id}] from:${m.from_agent} (${digestKind(m)}): ${snippet}`;
+      }
+    }
+    out += `\n\ncall inbox to read and mark as read.`;
+    return text(out);
+  }
+);
+
+server.tool(
+  "update_status",
+  "Update your status or role in-place without re-joining (no name conflict, no presence reset). Visible in who() so other agents know your current state.",
+  {
+    status: z
+      .string()
+      .optional()
+      .describe("Short status string, e.g. 'working', 'idle', 'done', 'blocked'"),
+    role: z
+      .string()
+      .optional()
+      .describe("Update your role text (what you're working on)"),
+  },
+  async ({ status, role }) => {
+    if (!me) return text("not joined — call join first.");
+    db.prepare(
+      `UPDATE agents SET status = COALESCE(?, status), role = COALESCE(?, role), last_seen = ? WHERE name = ?`
+    ).run(status ?? null, role ?? null, now(), me);
+    const row = db.prepare("SELECT status, role FROM agents WHERE name = ?").get(me);
+    let out = `updated ${me}:`;
+    if (status !== undefined) out += ` status=${status}`;
+    if (role !== undefined)   out += ` role=${role}`;
+    out += `.`;
+    if (row) out += ` (now: status=${row.status ?? "(none)"}, role=${row.role ?? "(none)"})`;
+    return text(out);
   }
 );
 
