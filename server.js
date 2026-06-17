@@ -70,10 +70,27 @@ for (const col of [
   try { db.exec(`ALTER TABLE agents ADD COLUMN ${col}`); } catch {}
 }
 for (const col of [
-  "topic TEXT",    // v2: topic tag on a message; NULL = no topic
+  "topic TEXT",      // v2: topic tag on a message; NULL = no topic
+  "max_claims INTEGER", // r2-a: if set, broadcast is claimable by up to N agents
 ]) {
   try { db.exec(`ALTER TABLE messages ADD COLUMN ${col}`); } catch {}
 }
+
+// r2-a: claims table — one row per (message, agent) that successfully claimed.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS claims (
+    message_id  INTEGER NOT NULL,
+    agent       TEXT NOT NULL,
+    claimed_at  TEXT NOT NULL,
+    slot        INTEGER NOT NULL,
+    PRIMARY KEY (message_id, agent)
+  );
+  CREATE TABLE IF NOT EXISTS assignments (
+    agent       TEXT PRIMARY KEY,
+    label       TEXT NOT NULL,
+    assigned_at TEXT NOT NULL
+  );
+`);
 
 // FTS5 virtual table for full-text search over message bodies.
 // content= and content_rowid= make this a "contentless" FTS5 table that syncs with the messages table.
@@ -393,7 +410,7 @@ server.tool(
 
 server.tool(
   "send",
-  "Send a fire-and-forget message to another session (or broadcast to all). Add topic to route the broadcast only to subscribed agents.",
+  "Send a fire-and-forget message to another session (or broadcast to all). Add topic to route the broadcast only to subscribed agents. Add max_claims to make a broadcast claimable (first N agents to call claim() get it; others are told it's full).",
   {
     message: z.string().describe("The message body"),
     to: z
@@ -406,8 +423,17 @@ server.tool(
       .describe(
         "Topic tag (e.g. 'alerts'). When broadcasting, only agents subscribed to this topic will receive it."
       ),
+    max_claims: z
+      .number()
+      .int()
+      .min(1)
+      .optional()
+      .describe(
+        "Make this broadcast claimable: only the first max_claims agents to call claim(message_id) get the slot. " +
+        "Others get 'full — already claimed by X, Y'. Only valid on broadcasts (no 'to')."
+      ),
   },
-  async ({ message, to, topic }) => {
+  async ({ message, to, topic, max_claims }) => {
     ensureJoined();
     if (to) {
       const known = onlineAgents().map((a) => a.name);
@@ -418,7 +444,11 @@ server.tool(
       }
     }
     const id = insertMessage({ to, kind: "message", body: message, topic });
-    let out = `sent #${id} ${to ? `to ${to}` : "as broadcast"}${topic ? ` [topic:${topic}]` : ""}.`;
+    // Store max_claims if set (broadcasts only — silently ignore on directed sends).
+    if (max_claims && !to) {
+      db.prepare("UPDATE messages SET max_claims = ? WHERE id = ?").run(max_claims, id);
+    }
+    let out = `sent #${id} ${to ? `to ${to}` : "as broadcast"}${topic ? ` [topic:${topic}]` : ""}${max_claims && !to ? ` [claimable:${max_claims}]` : ""}.`;
     if (to) {
       // Read-state: show recipient's last_active so sender knows if they're around.
       const recip = db.prepare("SELECT last_seen FROM agents WHERE name = ?").get(to);
@@ -427,6 +457,9 @@ server.tool(
       }
     } else if (topic) {
       out += ` only subscribers of "${topic}" will see this.`;
+    }
+    if (max_claims && !to) {
+      out += ` agents can claim a slot with claim(message_id: ${id}) — first ${max_claims} win.`;
     }
     out += ` they'll get it via their monitor (or next inbox check).`;
     return text(out);
@@ -812,6 +845,101 @@ server.tool(
     out += `.`;
     if (row) out += ` (now: status=${row.status ?? "(none)"}, role=${row.role ?? "(none)"})`;
     return text(out);
+  }
+);
+
+// ---------------------------------------------------------------------------
+// r2-a tools: claim, assign, tasks
+
+server.tool(
+  "claim",
+  "Atomically claim a slot on a claimable broadcast (one that was sent with max_claims). " +
+  "First max_claims callers succeed and get 'claimed — slot k/N'. Later callers get 'full — already claimed by X, Y'. " +
+  "Prevents the N-workers-race-on-the-same-task problem.",
+  {
+    message_id: z.number().int().describe("The #id of the claimable broadcast"),
+  },
+  async ({ message_id }) => {
+    ensureJoined();
+
+    // Atomic: wrap the check-and-insert in BEGIN IMMEDIATE so concurrent callers
+    // can't both pass the "slots available?" check and both get a slot.
+    try {
+      db.exec("BEGIN IMMEDIATE");
+
+      const msg = db.prepare("SELECT max_claims FROM messages WHERE id = ?").get(message_id);
+      if (!msg) {
+        db.exec("ROLLBACK");
+        return text(`no message #${message_id} exists.`);
+      }
+      if (!msg.max_claims) {
+        db.exec("ROLLBACK");
+        return text(`message #${message_id} is not claimable (was not sent with max_claims). ` +
+          `only the coordinator can make a broadcast claimable by setting max_claims on send.`);
+      }
+
+      const N = msg.max_claims;
+      const existing = db.prepare("SELECT agent, slot FROM claims WHERE message_id = ? ORDER BY slot").all(message_id);
+
+      // Already claimed by this agent?
+      const mine = existing.find((r) => r.agent === me);
+      if (mine) {
+        db.exec("ROLLBACK");
+        return text(`already claimed — you hold slot ${mine.slot}/${N} on #${message_id}.`);
+      }
+
+      if (existing.length >= N) {
+        db.exec("ROLLBACK");
+        const claimers = existing.map((r) => r.agent).join(", ");
+        return text(`full — already claimed by ${claimers} (${N}/${N} slots taken). #${message_id}`);
+      }
+
+      const slot = existing.length + 1;
+      db.prepare(
+        "INSERT INTO claims (message_id, agent, claimed_at, slot) VALUES (?, ?, ?, ?)"
+      ).run(message_id, me, now(), slot);
+      db.exec("COMMIT");
+
+      const allClaimers = [...existing.map((r) => r.agent), me].join(", ");
+      return text(`claimed — slot ${slot}/${N} on #${message_id}. holders so far: ${allClaimers}.`);
+    } catch (err) {
+      try { db.exec("ROLLBACK"); } catch {}
+      throw err;
+    }
+  }
+);
+
+server.tool(
+  "assign",
+  "Set or clear the task assignment for an agent. assign(agent, label) records who owns what. " +
+  "assign(agent, '') clears that agent's assignment. See all assignments with tasks().",
+  {
+    agent: z.string().describe("The agent name to assign (or clear)"),
+    label: z.string().describe("Short description of what they own, e.g. 'README draft'. Pass empty string to clear."),
+  },
+  async ({ agent, label }) => {
+    ensureJoined();
+    if (label === "") {
+      const deleted = db.prepare("DELETE FROM assignments WHERE agent = ?").run(agent);
+      return text(deleted.changes > 0 ? `cleared assignment for ${agent}.` : `${agent} had no assignment to clear.`);
+    }
+    db.prepare(
+      "INSERT INTO assignments (agent, label, assigned_at) VALUES (?, ?, ?) ON CONFLICT(agent) DO UPDATE SET label = excluded.label, assigned_at = excluded.assigned_at"
+    ).run(agent, label, now());
+    return text(`assigned ${agent}: "${label}".`);
+  }
+);
+
+server.tool(
+  "tasks",
+  "List the current who-owns-what assignment roster. Shows every agent that has an active assignment (set via assign()).",
+  {},
+  async () => {
+    ensureJoined();
+    const rows = db.prepare("SELECT agent, label, assigned_at FROM assignments ORDER BY assigned_at").all();
+    if (!rows.length) return text("no assignments set. use assign(agent, label) to record who owns what.");
+    const lines = rows.map((r) => `  ${r.agent}: ${r.label} (assigned ${ago(r.assigned_at)})`);
+    return text(`current assignments (${rows.length}):\n${lines.join("\n")}`);
   }
 );
 
