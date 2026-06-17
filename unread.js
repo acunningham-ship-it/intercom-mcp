@@ -12,6 +12,7 @@ export function unreadFor(db, agent, { from, topic } = {}) {
   let sql = `SELECT m.* FROM messages m
     WHERE m.from_agent != ?
       AND (m.to_agent = ? OR m.to_agent IS NULL)
+      AND m.kind != 'response'
       AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.agent = ? AND r.message_id = m.id)`;
   const params = [agent, agent, agent];
 
