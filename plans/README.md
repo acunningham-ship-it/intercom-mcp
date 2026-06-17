@@ -9,10 +9,16 @@ when done (unless a reviewer told you they maintain the index).
 
 | Plan | Title | Priority | Effort | Depends on | Status |
 |------|-------|----------|--------|------------|--------|
-| 001  | Wire the orphaned test file into `npm test` + add coverage for the gaps the other plans depend on | P1 | S | — | TODO |
-| 002  | Extract the shared "unread for me" query (with topic routing) so watchers match the server | P1 | M | 001 | TODO |
-| 003  | Make the `join` name-claim atomic (close the TOCTOU) | P2 | M | 001 | DONE |
-| 004  | Harden presence against PID reuse | P2 | M | 001 | TODO |
+| 001  | Wire the orphaned test file into `npm test` + add coverage for the gaps the other plans depend on | P1 | S | — | DONE (`79ed94b`) |
+| 002  | Extract the shared "unread for me" query (with topic routing) so watchers match the server | P1 | M | 001 | DONE (merge `a6c4cc1`) |
+| 003  | Make the `join` name-claim atomic (close the TOCTOU) | P2 | M | 001 | DONE (merge `9c7e19a`) |
+| 004  | Harden presence against PID reuse | P2 | M | 001 | DONE (merge `8206657`) |
+
+All four landed on branch `improve/intercom-fixes` (2026-06-17). Executed by intercom fleet
+workers (002: sop-worker, 003: buildoff-caption-analyzer, 004: worker6), each in an isolated
+git worktree; reviewed + integrated by right-hand; integration verified by judge. Not pushed
+(public remote — operator's call to merge to master + push). The 003/004 `registerAs` overlap
+was resolved by hand (transactional claim + pid_start capture combined).
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (one-line reason) | REJECTED (one-line rationale)
 
