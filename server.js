@@ -14,7 +14,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join as pathJoin } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -64,6 +64,7 @@ for (const col of [
   "tmux_socket TEXT",
   "tmux_pane TEXT",
   "topics TEXT",   // v2: JSON array of topic strings; NULL = receive all broadcasts
+  "pid_start TEXT", // v3: process start-time token from /proc/<pid>/stat field 22
 ]) {
   try { db.exec(`ALTER TABLE agents ADD COLUMN ${col}`); } catch {}
 }
@@ -102,6 +103,32 @@ function pidAlive(pid) {
   }
 }
 
+// Read process start-time from /proc/<pid>/stat field 22 (clock ticks since boot).
+// Returns null on any failure (non-Linux, missing proc, bad format).
+function processStartToken(pid) {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    // Field 22 is starttime; fields are space-separated but the process name
+    // (field 2) may contain spaces inside parens — find the closing paren first.
+    const closeParen = stat.lastIndexOf(")");
+    if (closeParen === -1) return null;
+    const fields = stat.slice(closeParen + 2).split(" ");
+    return fields[19] ?? null; // 0-indexed: field 22 is index 19 after the paren
+  } catch {
+    return null;
+  }
+}
+
+// An agent row is alive iff its PID is alive AND its start token matches (or
+// it has no stored token — backward-compat for rows written before this change).
+function agentAlive(row) {
+  if (!pidAlive(row.pid)) return false;
+  if (!row.pid_start) return true; // null/unknown → trust PID (backward-compat)
+  const current = processStartToken(row.pid);
+  if (current === null) return true; // can't read /proc → trust PID (safe fallback)
+  return current === row.pid_start;
+}
+
 function ago(iso) {
   const s = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
   if (s < 60) return `${Math.round(s)}s ago`;
@@ -129,6 +156,8 @@ function registerAs(rawName, role, topics) {
   // Wrap find-free-name + insert in a single IMMEDIATE transaction so two concurrent
   // sessions racing on the same name can't both pass the "is it free?" check.
   // Retry up to MAX_RETRIES suffix variants; final fallback is process-unique.
+  // pid_start (process start-time token) is captured so presence survives PID reuse.
+  const pidStart = processStartToken(process.pid);
   const MAX_RETRIES = 50;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -147,17 +176,17 @@ function registerAs(rawName, role, topics) {
       if (!holder) {
         // Name is unclaimed — insert fresh.
         db.prepare(
-          `INSERT INTO agents (name, pid, cwd, role, joined_at, last_seen, tmux_socket, tmux_pane, topics)
-           VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?)`
-        ).run(candidate, process.pid, process.cwd(), role ?? null, ts, ts, topicsJson);
+          `INSERT INTO agents (name, pid, pid_start, cwd, role, joined_at, last_seen, tmux_socket, tmux_pane, topics)
+           VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)`
+        ).run(candidate, process.pid, pidStart, process.cwd(), role ?? null, ts, ts, topicsJson);
         db.exec("COMMIT");
       } else if (holder.pid === process.pid || !pidAlive(holder.pid)) {
         // Same-process re-join or dead holder — update in place; preserve joined_at.
         db.prepare(
-          `UPDATE agents SET pid = ?, cwd = ?, role = COALESCE(?, role),
+          `UPDATE agents SET pid = ?, pid_start = ?, cwd = ?, role = COALESCE(?, role),
            last_seen = ?, tmux_socket = NULL, tmux_pane = NULL,
            topics = COALESCE(?, topics) WHERE name = ?`
-        ).run(process.pid, process.cwd(), role ?? null, ts, topicsJson, candidate);
+        ).run(process.pid, pidStart, process.cwd(), role ?? null, ts, topicsJson, candidate);
         db.exec("COMMIT");
       } else {
         // Live different-pid holder — cannot claim; suffix and retry.
@@ -193,7 +222,7 @@ function onlineAgents() {
   const rows = db.prepare("SELECT * FROM agents ORDER BY joined_at").all();
   const online = [];
   for (const a of rows) {
-    if (pidAlive(a.pid)) online.push(a);
+    if (agentAlive(a)) online.push(a);
     else db.prepare("DELETE FROM agents WHERE name = ?").run(a.name);
   }
   return online;
