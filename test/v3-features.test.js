@@ -261,6 +261,45 @@ await iota.close();
 await kappa.close();
 
 // -----------------------------------------------------------------------
+// 7. ATOMIC NAME CLAIM — live holder is never overwritten; routing stays correct
+
+console.log("\n=== atomic name-claim tests (plan 003) ===");
+
+const lambda = await connect("lambda");
+const mu     = await connect("mu");
+
+// lambda claims "claimtest"
+await callText(lambda, "join", { name: "claimtest", role: "original" });
+
+// mu tries the same name — must get suffixed, never overwrite lambda's row
+out = await callText(mu, "join", { name: "claimtest" });
+check("second claimer gets suffixed name", out.includes("claimtest-2"), out);
+check("second claimer confirmation text says claimtest-2", out.includes("claimtest-2"), out);
+
+// who must show both names
+out = await callText(lambda, "who", {});
+check("who shows original holder claimtest", out.includes("claimtest"), out);
+check("who shows suffixed holder claimtest-2", out.includes("claimtest-2"), out);
+
+// Send a directed message to "claimtest" — must land with lambda, not mu
+const nu = await connect("nu");
+await callText(nu, "join", { name: "nu-messenger" });
+await callText(nu, "send", { message: "directed to original", to: "claimtest" });
+
+// lambda (original holder) must receive it
+out = await callText(lambda, "inbox", {});
+check("original holder receives message directed to their name", out.includes("directed to original"), out);
+
+// mu (suffixed claimer) must NOT receive lambda's directed message
+out = await callText(mu, "inbox", {});
+check("suffixed claimer does NOT receive message directed at original name",
+  !out.includes("directed to original"), out);
+
+await lambda.close();
+await mu.close();
+await nu.close();
+
+// -----------------------------------------------------------------------
 
 await alpha.close();
 await beta.close();

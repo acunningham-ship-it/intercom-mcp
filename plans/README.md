@@ -11,7 +11,7 @@ when done (unless a reviewer told you they maintain the index).
 |------|-------|----------|--------|------------|--------|
 | 001  | Wire the orphaned test file into `npm test` + add coverage for the gaps the other plans depend on | P1 | S | — | TODO |
 | 002  | Extract the shared "unread for me" query (with topic routing) so watchers match the server | P1 | M | 001 | TODO |
-| 003  | Make the `join` name-claim atomic (close the TOCTOU) | P2 | M | 001 | TODO |
+| 003  | Make the `join` name-claim atomic (close the TOCTOU) | P2 | M | 001 | DONE |
 | 004  | Harden presence against PID reuse | P2 | M | 001 | TODO |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (one-line reason) | REJECTED (one-line rationale)
