@@ -848,6 +848,42 @@ server.tool(
   }
 );
 
+server.tool(
+  "respond_to_broadcast",
+  "Respond to a broadcast message as a worker. Stores your reply threaded to the broadcast (kind='response', reply_to=broadcast_id) so it does NOT flood the coordinator's inbox — collected on demand via collect_responses.",
+  {
+    message_id: z.number().int().describe("The #id of the broadcast message you are responding to"),
+    body: z.string().describe("Your response body"),
+  },
+  async ({ message_id, body }) => {
+    ensureJoined();
+    const orig = db.prepare("SELECT * FROM messages WHERE id = ?").get(message_id);
+    if (!orig) return text(`no message #${message_id} exists.`);
+    if (orig.to_agent !== null) return text(`message #${message_id} is not a broadcast — use reply() for directed messages.`);
+    const id = insertMessage({ to: null, kind: "response", body, replyTo: message_id });
+    return text(`response #${id} stored (reply_to #${message_id}). coordinator collects with collect_responses(${message_id}).`);
+  }
+);
+
+server.tool(
+  "collect_responses",
+  "Collect all worker responses to a broadcast you sent. Returns each response as 'agent: body', sorted by arrival. Does not mark them as read — call repeatedly to see new arrivals.",
+  {
+    message_id: z.number().int().describe("The #id of the broadcast message whose responses to collect"),
+  },
+  async ({ message_id }) => {
+    ensureJoined();
+    const orig = db.prepare("SELECT * FROM messages WHERE id = ?").get(message_id);
+    if (!orig) return text(`no message #${message_id} exists.`);
+    const responses = db
+      .prepare("SELECT * FROM messages WHERE reply_to = ? AND kind = 'response' ORDER BY id")
+      .all(message_id);
+    if (!responses.length) return text(`no responses to broadcast #${message_id} yet.`);
+    const lines = responses.map((r) => `${r.from_agent}: ${r.body}`);
+    return text(`${responses.length} response(s) to broadcast #${message_id}:\n${lines.join("\n")}`);
+  }
+);
+
 // ---------------------------------------------------------------------------
 // r2-a tools: claim, assign, tasks
 
