@@ -306,6 +306,170 @@ await beta.close();
 await gamma.close();
 rmSync(dir, { recursive: true, force: true });
 
+// -----------------------------------------------------------------------
+// Lane A: THREADING, GET_MESSAGE, REPLY ALIAS, FTS SEARCH
+
+console.log("\n=== Lane A: threading + get_message + reply alias + FTS search ===");
+
+const alice = await connect("alice");
+const bob   = await connect("bob");
+
+await callText(alice, "join", { name: "alice" });
+await callText(bob,   "join", { name: "bob" });
+
+// 1. THREADING — reply_to chain and thread tool
+
+console.log("\n--- test: threading ---");
+
+// alice asks bob a question
+const askResp = await callText(alice, "ask", {
+  question: "what is the answer to life?",
+  to: "bob",
+  timeout_seconds: 1,
+});
+// Extract the message ID from "question #X"
+const q1 = askResp.match(/question #(\d+)/)?.[1];
+check("ask returns message id in response", !!q1, `q1=${q1}, response=${askResp}`);
+
+// bob replies with an answer
+let result = await callText(bob, "inbox", {});
+check("bob sees the question", result.includes("what is the answer to life?"), result);
+
+const aId = result.match(/#(\d+)\]/)?.[1];
+check("inbox shows question with #id", !!aId, `aId=${aId}`);
+
+const replyResp = await callText(bob, "reply", { message_id: parseInt(aId), message: "42" });
+// Extract from "replied to #X with #Y" → extract the last match
+const a1Match = replyResp.match(/with #(\d+)/);
+const a1 = a1Match ? a1Match[1] : replyResp.match(/#(\d+)/)?.[1];
+check("reply returns answer message id", !!a1, `a1=${a1}, response=${replyResp}`);
+
+// alice reads the answer
+result = await callText(alice, "inbox", {});
+check("alice receives answer", result.includes("42"), result);
+check("answer shows reply_to prefix", result.includes("↩"), result);
+
+// 2. GET_MESSAGE — fetch any message by id
+
+console.log("\n--- test: get_message ---");
+
+result = await callText(bob, "get_message", { message_id: parseInt(q1) });
+check("get_message retrieves question", result.includes("what is the answer to life?"), result);
+
+result = await callText(alice, "get_message", { message_id: parseInt(a1) });
+check("get_message retrieves answer", result.includes("42"), result);
+
+// 3. REPLY ALIAS — both 'message' and 'text' params work
+
+console.log("\n--- test: reply alias (text → message) ---");
+
+// bob sends a message to alice
+const sendResp = await callText(bob, "send", { message: "hello alice", to: "alice" });
+const b1 = sendResp.match(/sent #(\d+)/)?.[1];
+check("send returns message id", !!b1, `b1=${b1}, response=${sendResp}`);
+
+await callText(alice, "inbox", {});
+
+// alice replies using the 'text' param instead of 'message'
+const replyResp2 = await callText(alice, "reply", { message_id: parseInt(b1), text: "hello back" });
+check("reply with 'text' param works", replyResp2.includes("replied to"), replyResp2);
+check("reply with 'text' param shows reply id", replyResp2.includes("#"), replyResp2);
+
+// bob reads it
+result = await callText(bob, "inbox", {});
+check("bob receives reply sent via 'text' param", result.includes("hello back"), result);
+
+// 4. REPLY WITHOUT PARAMS — should error with correct signature
+
+console.log("\n--- test: reply error handling ---");
+
+result = await callText(alice, "reply", { message_id: parseInt(b1) });
+check("reply without message/text shows error", result.includes("reply requires"), result);
+check("reply error shows correct signature", result.includes("message_id") && result.includes("message"), result);
+
+// 5. THREAD TOOL — walk ancestors and descendants
+
+console.log("\n--- test: thread tool ---");
+
+// set up a longer conversation: alice -> bob -> alice -> bob
+const sendResp1 = await callText(alice, "send", {
+  message: "first question",
+  to: "bob"
+});
+const firstQ = sendResp1.match(/sent #(\d+)/)?.[1];
+await callText(bob, "inbox", {});
+
+const replyResp1 = await callText(bob, "reply", {
+  message_id: parseInt(firstQ),
+  message: "first answer"
+});
+const firstA = replyResp1.match(/with #(\d+)/)?.[1];
+await callText(alice, "inbox", {});
+
+const replyResp2q = await callText(alice, "reply", {
+  message_id: parseInt(firstA),
+  message: "follow up question"
+});
+const secondQ = replyResp2q.match(/with #(\d+)/)?.[1];
+await callText(bob, "inbox", {});
+
+const replyResp2a = await callText(bob, "reply", {
+  message_id: parseInt(secondQ),
+  message: "follow up answer"
+});
+const secondA = replyResp2a.match(/with #(\d+)/)?.[1];
+await callText(alice, "inbox", {});
+
+// now call thread from the middle — should see the whole chain
+result = await callText(alice, "thread", { message_id: parseInt(firstA) });
+check("thread shows ancestors", result.includes("first question"), result);
+check("thread shows descendants", result.includes("follow up answer"), result);
+check("thread shows root message", result.includes("first answer"), result);
+check("thread shows message count", result.includes("4 message"), result);
+
+// thread from the last message in chain
+result = await callText(bob, "thread", { message_id: parseInt(secondA) });
+check("thread from leaf includes all ancestors",
+  result.includes("first question") && result.includes("first answer") && result.includes("follow up question"),
+  result);
+
+// 6. FTS SEARCH — history with query param
+
+console.log("\n--- test: FTS search via history query ---");
+
+// insert some messages with different content
+await callText(alice, "send", { message: "urgent security alert", to: "bob" });
+await callText(alice, "send", { message: "normal status update", to: "bob" });
+await callText(alice, "send", { message: "critical bug found", to: "bob" });
+
+// search for "urgent"
+result = await callText(alice, "history", { query: "urgent" });
+check("FTS query finds 'urgent'", result.includes("urgent security alert"), result);
+check("FTS query excludes non-matching", !result.includes("normal status"), result);
+
+// search for "critical"
+result = await callText(alice, "history", { query: "critical" });
+check("FTS query finds 'critical'", result.includes("critical bug"), result);
+
+// search for non-existent term
+result = await callText(alice, "history", { query: "nonexistent" });
+check("FTS query returns no results for non-matching term", result.includes("no messages matching"), result);
+
+// search combining with with= param (search within a conversation)
+result = await callText(alice, "history", { with: "bob", query: "status" });
+check("FTS query with 'with' filters results", result.includes("normal status update"), result);
+
+// 7. FMTMESSAGE REPLY PREFIX — all formatted output includes reply_to prefix
+
+console.log("\n--- test: fmtMessage reply_to prefix ---");
+
+result = await callText(alice, "get_message", { message_id: parseInt(secondQ) });
+check("formatted reply shows ↩ prefix", result.includes("↩"), result);
+check("formatted reply shows reference id", result.includes(`#${firstA}`), result);
+
+await alice.close();
+await bob.close();
+
 if (failed) {
   console.error(`\n${failed} check(s) failed`);
   process.exit(1);
