@@ -18,6 +18,7 @@ import { DatabaseSync } from "node:sqlite";
 import { homedir } from "node:os";
 import { join as pathJoin } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import { unreadFor } from "./unread.js";
 
 const args = process.argv.slice(2);
 const opt = (flag, def) => {
@@ -67,16 +68,9 @@ if (!openDb()) {
   process.exit(1);
 }
 
-// Same "unread for me" predicate the server uses for inbox.
 const getUnread = () => {
   try {
-    return db.prepare(
-      `SELECT m.id, m.from_agent, m.to_agent FROM messages m
-         WHERE m.from_agent != ?
-           AND (m.to_agent = ? OR m.to_agent IS NULL)
-           AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.agent = ? AND r.message_id = m.id)
-         ORDER BY m.id`
-    ).all(me, me, me);
+    return unreadFor(db, me);
   } catch {
     // DB locked or tables not ready — return empty and retry next tick
     return [];

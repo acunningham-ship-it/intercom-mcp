@@ -20,6 +20,7 @@ import { DatabaseSync } from "node:sqlite";
 import { homedir } from "node:os";
 import { join as pathJoin } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import { unreadFor } from "./unread.js";
 
 const args = process.argv.slice(2);
 const opt = (flag, def) => {
@@ -69,15 +70,7 @@ if (!openDb()) {
 
 function getUnread() {
   try {
-    return db
-      .prepare(
-        `SELECT m.id, m.from_agent, m.to_agent, m.kind FROM messages m
-         WHERE m.from_agent != ?
-           AND (m.to_agent = ? OR m.to_agent IS NULL)
-           AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.agent = ? AND r.message_id = m.id)
-         ORDER BY m.from_agent, m.id`
-      )
-      .all(me, me, me);
+    return unreadFor(db, me);
   } catch {
     return [];
   }

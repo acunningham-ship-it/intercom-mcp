@@ -18,6 +18,7 @@ import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join as pathJoin } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import { unreadFor as unreadForShared } from "./unread.js";
 
 const DB_PATH =
   process.env.INTERCOM_DB ??
@@ -201,31 +202,7 @@ function insertMessage({ to, kind, body, replyTo, topic }) {
 // filters.from  — only show messages from this agent name
 // filters.topic — only show messages tagged with this topic
 function unreadFor(agent, { from, topic } = {}) {
-  let sql = `SELECT m.* FROM messages m
-    WHERE m.from_agent != ?
-      AND (m.to_agent = ? OR m.to_agent IS NULL)
-      AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.agent = ? AND r.message_id = m.id)`;
-  const params = [agent, agent, agent];
-
-  if (from) { sql += ` AND m.from_agent = ?`; params.push(from); }
-  if (topic) { sql += ` AND m.topic = ?`; params.push(topic); }
-  sql += ` ORDER BY m.id`;
-
-  let msgs = db.prepare(sql).all(...params);
-
-  // Topic routing (JS layer): agents with a topics subscription only see topic-tagged
-  // broadcasts they subscribed to. topics=null = no subscription set = see all (backwards compat).
-  const agentRow = db.prepare("SELECT topics FROM agents WHERE name = ?").get(agent);
-  const myTopics = agentRow?.topics ? JSON.parse(agentRow.topics) : null;
-
-  if (myTopics !== null) {
-    msgs = msgs.filter((m) => {
-      if (m.to_agent || !m.topic) return true; // directed msg or non-topic broadcast: always show
-      return myTopics.includes(m.topic);        // topic broadcast: check subscription
-    });
-  }
-
-  return msgs;
+  return unreadForShared(db, agent, { from, topic });
 }
 
 function markRead(agent, ids) {
