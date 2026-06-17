@@ -1,12 +1,12 @@
 {
   "name": "intercom-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MCP server letting Claude Code sessions on the same box talk to each other (ask/answer/broadcast) via a shared SQLite message bus",
   "type": "module",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node test/two-agents.test.js && node test/watch.test.js && node test/v2-watchers.test.js"
+    "test": "node test/two-agents.test.js && node test/watch.test.js && node test/v2-watchers.test.js && node test/v3-features.test.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

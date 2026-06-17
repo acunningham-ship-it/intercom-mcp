@@ -20,13 +20,23 @@ Claude session C ── server.js ─┘
 
 | Tool | What it does |
 |------|--------------|
-| `join` | Register under a name (e.g. project name) + see who else is on. Call first. |
-| `who` | List online sessions: name, role, cwd, last activity. |
-| `send` | Fire-and-forget message to one agent, or broadcast (omit `to`). |
+| `join(name, role?, topics?)` | Register under a name + see who else is on. Pass `topics:["alerts","rmi"]` to subscribe to specific topic broadcasts only; omit to receive all. Call first. |
+| `who` | List online sessions: name, role, cwd, `last_active` time, and presence status (`live` <30s / `idle` <5m / `stale` ≥5m). |
+| `send(message, to?, topic?)` | Fire-and-forget message to one agent, or broadcast (omit `to`). Add `topic` to route only to subscribed agents. Directed sends show recipient `last_active` in the result. |
 | `ask` | Send a question and **block** until answered (default 60s, max 240s). Times out gracefully — the question stays queued. |
 | `reply` | Answer a question / respond to a message by `#id`. Unblocks a waiting `ask` within ~1s. |
-| `inbox` | Fetch unread messages. `wait_seconds` long-polls until something arrives. |
-| `history` | Re-read recent traffic (optionally filtered to one agent). |
+| `inbox(wait_seconds?, from_agent?, topic?)` | Fetch unread messages. `wait_seconds` long-polls. `from_agent` or `topic` filter both the fetch and the long-poll. |
+| `history(with?, limit?)` | Re-read recent traffic. Shows ✓ read / · unread state for each message. |
+
+## v2 features
+
+**Presence heartbeat** — every tool call bumps `last_seen`; `who()` shows `last_active Xs ago [live/idle/stale]`. Live = <30s, idle = <5m, stale = ≥5m.
+
+**Read-state** — `send` to a named agent reports their `last_active` so you know if they'll see it soon. `history` annotates each message: `✓ read` (confirmed delivered) or `· unread` (waiting).
+
+**Topic routing** — `join(name, topics:["alerts"])` subscribes you to specific broadcasts. `send(message, topic:"alerts")` routes to subscribers only (plus agents with no topics set — backward-compat). Agents that join with `topics:[]` only receive non-topic broadcasts and skip all topic-tagged ones.
+
+**Inbox filters** — `inbox(from_agent:"alice")` or `inbox(topic:"alerts")` filter both the immediate fetch and the long-poll (`wait_seconds`). Filters compose with topic routing — you only see what you're subscribed to.
 
 ## Delivery & notifications
 
@@ -41,8 +51,11 @@ notification without polluting your session's transcript, arm a watcher:
 - **Pull / blocking:** `inbox` long-polls (`wait_seconds`), and `ask` already blocks
   until the other side `reply`s (~1s), so request/response needs no watcher at all.
 
-Broadcasts are pull-only by design: they don't nudge every session, so a busy fleet
-doesn't spam everyone. Directed messages are the ones that notify.
+No message is ever typed into a session's terminal. Both directed and broadcast
+messages are surfaced the same way — through the recipient's Monitor/watcher or
+their next `inbox` check — so a busy fleet never gets keystrokes injected into a
+live session. (An earlier version send-keys'd a nudge into tmux panes; that was
+removed once monitors handled delivery.)
 
 ## Watch the fleet
 
