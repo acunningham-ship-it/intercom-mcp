@@ -14,7 +14,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join as pathJoin } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -63,6 +63,7 @@ for (const col of [
   "tmux_socket TEXT",
   "tmux_pane TEXT",
   "topics TEXT",   // v2: JSON array of topic strings; NULL = receive all broadcasts
+  "pid_start TEXT", // v3: process start-time token from /proc/<pid>/stat field 22
 ]) {
   try { db.exec(`ALTER TABLE agents ADD COLUMN ${col}`); } catch {}
 }
@@ -99,6 +100,32 @@ function pidAlive(pid) {
   } catch (err) {
     return err.code === "EPERM";
   }
+}
+
+// Read process start-time from /proc/<pid>/stat field 22 (clock ticks since boot).
+// Returns null on any failure (non-Linux, missing proc, bad format).
+function processStartToken(pid) {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    // Field 22 is starttime; fields are space-separated but the process name
+    // (field 2) may contain spaces inside parens — find the closing paren first.
+    const closeParen = stat.lastIndexOf(")");
+    if (closeParen === -1) return null;
+    const fields = stat.slice(closeParen + 2).split(" ");
+    return fields[19] ?? null; // 0-indexed: field 22 is index 19 after the paren
+  } catch {
+    return null;
+  }
+}
+
+// An agent row is alive iff its PID is alive AND its start token matches (or
+// it has no stored token — backward-compat for rows written before this change).
+function agentAlive(row) {
+  if (!pidAlive(row.pid)) return false;
+  if (!row.pid_start) return true; // null/unknown → trust PID (backward-compat)
+  const current = processStartToken(row.pid);
+  if (current === null) return true; // can't read /proc → trust PID (safe fallback)
+  return current === row.pid_start;
 }
 
 function ago(iso) {
@@ -143,16 +170,18 @@ function registerAs(rawName, role, topics) {
   const ts = now();
   // topics: null if not passed (COALESCE preserves existing); JSON string if provided.
   const topicsJson = Array.isArray(topics) ? JSON.stringify(topics) : null;
+  const pidStart = processStartToken(process.pid);
   db.prepare(
-    `INSERT INTO agents (name, pid, cwd, role, joined_at, last_seen, tmux_socket, tmux_pane, topics)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO agents (name, pid, pid_start, cwd, role, joined_at, last_seen, tmux_socket, tmux_pane, topics)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(name) DO UPDATE SET
-       pid = excluded.pid, cwd = excluded.cwd,
+       pid = excluded.pid, pid_start = excluded.pid_start,
+       cwd = excluded.cwd,
        role = COALESCE(excluded.role, agents.role),
        last_seen = excluded.last_seen,
        tmux_socket = excluded.tmux_socket, tmux_pane = excluded.tmux_pane,
        topics = COALESCE(excluded.topics, agents.topics)`
-  ).run(name, process.pid, process.cwd(), role ?? null, ts, ts, null, null, topicsJson);
+  ).run(name, process.pid, pidStart, process.cwd(), role ?? null, ts, ts, null, null, topicsJson);
   // Drop our previous name if we renamed mid-session.
   if (me && me !== name) {
     db.prepare("DELETE FROM agents WHERE name = ? AND pid = ?").run(me, process.pid);
@@ -173,7 +202,7 @@ function onlineAgents() {
   const rows = db.prepare("SELECT * FROM agents ORDER BY joined_at").all();
   const online = [];
   for (const a of rows) {
-    if (pidAlive(a.pid)) online.push(a);
+    if (agentAlive(a)) online.push(a);
     else db.prepare("DELETE FROM agents WHERE name = ?").run(a.name);
   }
   return online;
