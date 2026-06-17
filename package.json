@@ -6,7 +6,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node test/two-agents.test.js && node test/noise-and-presence.test.js && node test/watch.test.js && node test/v2-watchers.test.js && node test/v3-features.test.js && node test/topic-watcher.test.js && node test/pid-reuse.test.js"
+    "test": "node test/two-agents.test.js && node test/noise-and-presence.test.js && node test/watch.test.js && node test/v2-watchers.test.js && node test/v3-features.test.js && node test/topic-watcher.test.js && node test/pid-reuse.test.js && node test/r2-a-claim-assign.test.js && node test/respond-collect.test.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
