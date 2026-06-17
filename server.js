@@ -122,43 +122,62 @@ function sanitizeName(name) {
 }
 
 function registerAs(rawName, role, topics) {
-  let name = sanitizeName(rawName);
-  if (!name) name = `agent-${process.pid}`;
-  // If the name is held by a different *live* process, suffix; a dead holder is replaced.
-  const holder = db
-    .prepare("SELECT pid FROM agents WHERE name = ?")
-    .get(name);
-  if (holder && holder.pid !== process.pid && pidAlive(holder.pid)) {
-    let i = 2;
-    while (true) {
-      const candidate = `${name}-${i}`;
-      const h = db.prepare("SELECT pid FROM agents WHERE name = ?").get(candidate);
-      if (!h || h.pid === process.pid || !pidAlive(h.pid)) {
-        name = candidate;
-        break;
-      }
-      i++;
-    }
-  }
-  const ts = now();
+  const baseName = sanitizeName(rawName) || `agent-${process.pid}`;
   // topics: null if not passed (COALESCE preserves existing); JSON string if provided.
   const topicsJson = Array.isArray(topics) ? JSON.stringify(topics) : null;
-  db.prepare(
-    `INSERT INTO agents (name, pid, cwd, role, joined_at, last_seen, tmux_socket, tmux_pane, topics)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(name) DO UPDATE SET
-       pid = excluded.pid, cwd = excluded.cwd,
-       role = COALESCE(excluded.role, agents.role),
-       last_seen = excluded.last_seen,
-       tmux_socket = excluded.tmux_socket, tmux_pane = excluded.tmux_pane,
-       topics = COALESCE(excluded.topics, agents.topics)`
-  ).run(name, process.pid, process.cwd(), role ?? null, ts, ts, null, null, topicsJson);
-  // Drop our previous name if we renamed mid-session.
-  if (me && me !== name) {
-    db.prepare("DELETE FROM agents WHERE name = ? AND pid = ?").run(me, process.pid);
+  // Wrap find-free-name + insert in a single IMMEDIATE transaction so two concurrent
+  // sessions racing on the same name can't both pass the "is it free?" check.
+  // Retry up to MAX_RETRIES suffix variants; final fallback is process-unique.
+  const MAX_RETRIES = 50;
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const candidate =
+      attempt === 0            ? baseName
+      : attempt < MAX_RETRIES ? `${baseName}-${attempt + 1}`
+      :                         `${baseName}-${process.pid}`;
+
+    try {
+      db.exec("BEGIN IMMEDIATE");
+      const ts = now();
+      const holder = db
+        .prepare("SELECT pid FROM agents WHERE name = ?")
+        .get(candidate);
+
+      if (!holder) {
+        // Name is unclaimed — insert fresh.
+        db.prepare(
+          `INSERT INTO agents (name, pid, cwd, role, joined_at, last_seen, tmux_socket, tmux_pane, topics)
+           VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?)`
+        ).run(candidate, process.pid, process.cwd(), role ?? null, ts, ts, topicsJson);
+        db.exec("COMMIT");
+      } else if (holder.pid === process.pid || !pidAlive(holder.pid)) {
+        // Same-process re-join or dead holder — update in place; preserve joined_at.
+        db.prepare(
+          `UPDATE agents SET pid = ?, cwd = ?, role = COALESCE(?, role),
+           last_seen = ?, tmux_socket = NULL, tmux_pane = NULL,
+           topics = COALESCE(?, topics) WHERE name = ?`
+        ).run(process.pid, process.cwd(), role ?? null, ts, topicsJson, candidate);
+        db.exec("COMMIT");
+      } else {
+        // Live different-pid holder — cannot claim; suffix and retry.
+        db.exec("ROLLBACK");
+        continue;
+      }
+    } catch (err) {
+      try { db.exec("ROLLBACK"); } catch {}
+      throw err;
+    }
+
+    // Claimed successfully — drop our previous name if we renamed mid-session.
+    if (me && me !== candidate) {
+      db.prepare("DELETE FROM agents WHERE name = ? AND pid = ?").run(me, process.pid);
+    }
+    me = candidate;
+    return candidate;
   }
-  me = name;
-  return name;
+
+  // Unreachable: the process.pid fallback at attempt === MAX_RETRIES is always unique.
+  throw new Error("registerAs: exhausted all suffix attempts");
 }
 
 function ensureJoined() {
