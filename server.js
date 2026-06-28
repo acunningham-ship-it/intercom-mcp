@@ -468,7 +468,7 @@ server.tool(
 
 server.tool(
   "ask",
-  "Ask another session a question and wait for their answer (blocks up to timeout_seconds). If they don't reply in time, the question stays queued and you can check inbox later for the answer.",
+  "Ask another session a question and wait for their answer (blocks up to timeout_seconds). If they don't reply in time, the question stays queued and you can check inbox later for the answer. If the recipient is already stale (idle 5+ min, won't answer live), ask returns fast after a short grace instead of blocking the full timeout — the question is still queued and the answer still lands in your inbox.",
   {
     question: z.string().describe("The question to ask"),
     to: z
@@ -486,16 +486,27 @@ server.tool(
   async ({ question, to, timeout_seconds }) => {
     ensureJoined();
     const timeout = (timeout_seconds ?? 60) * 1000;
+    let recipStale = false;
     if (to) {
-      const known = onlineAgents().map((a) => a.name);
-      if (!known.includes(to)) {
+      const recip = onlineAgents().find((a) => a.name === to);
+      if (!recip) {
+        const others = onlineAgents().map((a) => a.name).filter((n) => n !== me);
         return text(
-          `no online agent named "${to}". online: ${known.filter((n) => n !== me).join(", ") || "(nobody else)"}.\nquestion NOT sent.`
+          `no online agent named "${to}". online: ${others.join(", ") || "(nobody else)"}.\nquestion NOT sent.`
         );
       }
+      recipStale = statusLabel(recip.last_seen) === "stale";
     }
     const qid = insertMessage({ to, kind: "question", body: question });
-    const deadline = Date.now() + timeout;
+    // Smart stale-ask: a provably-stale recipient (no tool call in 5+ min) won't answer
+    // in real time, so don't burn the full timeout blocking on them. Cap the wait to a
+    // short grace window — the question is still queued and the answer still lands in
+    // your inbox; we just return fast instead of stalling the caller. The grace still
+    // catches an agent that's active-but-quiet (just crossed the 5-min line).
+    // ponytail: fixed 6s grace; make it configurable only if a caller ever needs to.
+    const STALE_GRACE_MS = 6000;
+    const effectiveTimeout = recipStale ? Math.min(timeout, STALE_GRACE_MS) : timeout;
+    const deadline = Date.now() + effectiveTimeout;
     while (Date.now() < deadline) {
       const answer = db
         .prepare("SELECT * FROM messages WHERE kind = 'answer' AND reply_to = ? ORDER BY id LIMIT 1")
@@ -506,8 +517,12 @@ server.tool(
       }
       await sleep(400);
     }
+    const waited = Math.round(effectiveTimeout / 1000);
+    const staleNote = recipStale
+      ? ` (recipient "${to}" was stale — returned after ${waited}s instead of blocking the full ${timeout / 1000}s; they'll get it on their next inbox check.)`
+      : "";
     return text(
-      `no answer after ${timeout / 1000}s. question #${qid} is still queued for ${to ?? "everyone"} — they'll see it on their next inbox check. check your inbox later for the answer (it will arrive as an 'answer' referencing #${qid}).`
+      `no answer after ${waited}s. question #${qid} is still queued for ${to ?? "everyone"} — they'll see it on their next inbox check. check your inbox later for the answer (it will arrive as an 'answer' referencing #${qid}).${staleNote}`
     );
   }
 );
