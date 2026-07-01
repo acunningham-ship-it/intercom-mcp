@@ -30,11 +30,24 @@ requirement is met — by running it and looking at the result, not by hoping.**
    (the command you ran + what you saw), and any requirement you could NOT meet. A short honest "done
    except X" beats a confident "done" that's wrong — because the next person trusts your word.
 
+## The done-gate: prove it with `rh-verify` (paste the output)
+Claiming you verified isn't enough — SHOW the gate passing. Run the check that fits your artifact and
+paste the **exact command + its output** into your DONE message. Exit 0 = PASS; anything else = not done.
+- code/script you wrote → `rh-verify python <path> --run`  (syntax-parses + runs its self-test)
+- a built artifact (workflow JSON, templates, config) → `rh-verify artifact <path>`  (must be **ZERO HIGH
+  stub/placeholder/fake markers** — or name each remaining one and why it's intentional, e.g. a legal `[PENDING LAWYER]`)
+- a running service/endpoint → `rh-verify run "<cmd>" --expect <substr>`  ·  `rh-verify service|http|port …`
+- an n8n workflow → `rh-verify n8n <id>`
+
+(`rh-verify` is on PATH; add `--json` if an orchestrator is gating on you.) "I verified it" with no gate
+output does NOT count — the next person trusts the gate, not your adjective.
+
 ## Before you send "DONE", run this checklist
 - [ ] Re-read the task. Every requirement done? (not most — every one)
 - [ ] I RAN it / opened it / hit the API — and saw it actually work, just now.
 - [ ] Output matches the real spec/brand/data (I didn't invent anything).
 - [ ] No stubs, placeholders, or TODOs masquerading as finished.
 - [ ] My DONE message states how I verified + anything incomplete.
+- [ ] `rh-verify` PASSED (exit 0) on my artifact and I pasted the exact command + its output.
 
 If any box is unchecked, you are not done. Keep working.
