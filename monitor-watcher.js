@@ -6,7 +6,8 @@
 // poll interval without side effects.
 //
 // Usage:
-//   # Run under Claude Code's Monitor tool
+//   # Run under Claude Code's Monitor tool (both forms work; --me wins if both given)
+//   node /path/to/monitor-watcher.js <agent-name> [--interval 2]
 //   node /path/to/monitor-watcher.js --me <agent-name> [--interval 2]
 //
 // Each line format:
@@ -28,9 +29,20 @@ const opt = (flag, def) => {
   return i >= 0 && args[i + 1] ? args[i + 1] : def;
 };
 
-const me = opt("--me", process.env.INTERCOM_NAME);
+// First positional (non-flag) arg — so the bare form `monitor-watcher.js <name>` works,
+// not only `--me <name>`. CHARTER.md/builder.md document the bare form; it used to exit(2).
+// Skips each `--flag` and the value that follows it (both known flags take a value).
+const firstPositional = () => {
+  for (let i = 0; i < args.length; i++) {
+    if (args[i].startsWith("--")) { i++; continue; }
+    return args[i];
+  }
+  return undefined;
+};
+
+const me = opt("--me", null) ?? firstPositional() ?? process.env.INTERCOM_NAME;
 if (!me) {
-  console.error("usage: node monitor-watcher.js --me <name> [--interval 2]");
+  console.error("usage: node monitor-watcher.js <name> | --me <name> [--interval 2]");
   process.exit(2);
 }
 
