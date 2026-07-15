@@ -3,7 +3,7 @@
 // Verifies: responses are threaded, collect returns them all, inbox stays clean.
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -90,6 +90,14 @@ out = await callText(alice, "send", { message: "empty broadcast" });
 const emptyId = Number(out.match(/#(\d+)/)[1]);
 out = await callText(alice, "collect_responses", { message_id: emptyId });
 check("collect_responses on broadcast with no responses says 'no responses'", out.includes("no responses"), out);
+
+// Close the clients (shuts down the spawned server children) + drop the temp dir, else the
+// open stdio pipes keep the event loop alive and the process hangs AFTER passing — which
+// stalled the whole `npm test` && chain at this file.
+await alice.close();
+await bob.close();
+await carol.close();
+rmSync(dir, { recursive: true, force: true });
 
 if (failed) {
   console.error(`\n${failed} check(s) failed.`);
