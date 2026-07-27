@@ -55,17 +55,22 @@ check("alice visible in who before corruption", out.includes("alice"), out);
   db.close();
 }
 
-// who triggers onlineAgents → agentAlive detects mismatch → prunes alice's row
+// R4: agentAlive detects the mismatch → alice is OFFLINE (a durable identity), so
+// she's hidden from the default (online-only) who — but the row is NOT deleted.
 out = await callText(s1, "who", {});
-check("alice pruned from who on pid_start mismatch", !out.includes("alice"), out);
+check("alice hidden from default who on pid_start mismatch", !out.includes("alice"), out);
 
-// Confirm the row is actually gone from the DB
+// Confirm the row is RETAINED as an offline identity (R4: no destructive prune on who)
 {
   const db = new DatabaseSync(DB);
   const row = db.prepare("SELECT * FROM agents WHERE name = ?").get("alice");
-  check("alice row deleted from DB", row === undefined, JSON.stringify(row));
+  check("alice row retained as offline identity (not deleted)", row !== undefined, JSON.stringify(row));
   db.close();
 }
+
+// And she surfaces under who include_offline (still addressable — messages queue)
+out = await callText(s1, "who", { include_offline: true });
+check("alice appears under who include_offline", out.includes("alice"), out);
 
 // ── Part 2: NULL pid_start → treated as alive (backward-compat) ──────────────
 console.log("\n=== backward-compat: NULL pid_start + alive PID → online ===");

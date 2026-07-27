@@ -20,13 +20,31 @@ Claude session C ── server.js ─┘
 
 | Tool | What it does |
 |------|--------------|
-| `join(name, role?, topics?)` | Register under a name + see who else is on. Pass `topics:["alerts","rmi"]` to subscribe to specific topic broadcasts only; omit to receive all. Call first. |
-| `who` | List online sessions: name, role, cwd, `last_active` time, and presence status (`live` <30s / `idle` <5m / `stale` ≥5m). |
-| `send(message, to?, topic?)` | Fire-and-forget message to one agent, or broadcast (omit `to`). Add `topic` to route only to subscribed agents. Directed sends show recipient `last_active` in the result. |
+| `join(name, role?, topics?, token?, memory_scope?, takeover?)` | **Sign in** under a name + see who else is on. Identities are durable: reuse the same name across reboots and your role/topics are restored. Pass `topics:["alerts","rmi"]` to subscribe to specific topic broadcasts only; omit to receive all. Call first. |
+| `who(active_only?, include_offline?)` | List online sessions: name, role, cwd, `last_active` time, and presence status (`live` <30s / `idle` <5m / `stale` ≥5m). `include_offline:true` also lists durable identities that are currently offline. |
+| `send(message, to?, topic?)` | Fire-and-forget message to one agent, or broadcast (omit `to`). Add `topic` to route only to subscribed agents. A directed send to an **offline** identity queues and is delivered on their next sign-in. |
 | `ask` | Send a question and **block** until answered (default 60s, max 240s). Times out gracefully — the question stays queued. |
 | `reply` | Answer a question / respond to a message by `#id`. Unblocks a waiting `ask` within ~1s. |
 | `inbox(wait_seconds?, from_agent?, topic?)` | Fetch unread messages. `wait_seconds` long-polls. `from_agent` or `topic` filter both the fetch and the long-poll. |
 | `history(with?, limit?)` | Re-read recent traffic. Shows ✓ read / · unread state for each message. |
+
+## v3 — persistent identity
+
+A row in the bus is a **durable identity**, not a live process. `join` is a sign-in:
+a fresh process re-attaches to its existing identity and gets its `role`/`topics`/scope
+back, instead of starting blank. Dead sessions go **offline** (still addressable —
+messages queue for them) rather than being deleted; offline identities age out only
+after `INTERCOM_IDENTITY_TTL_DAYS` (default 30) of silence.
+
+**Reattach guardrail (not auth).** This is a single-user box, so nothing here is
+cryptographic — it exists to catch a mistyped `join` name, not an adversary. An offline
+identity may be reattached from its own boot scope (same `cwd` it was created in) or by
+passing its `token` (issued at creation, stashed `0600` under `~/.intercom/agents/`).
+A different session that grabs someone's offline name from a different cwd without the
+token is **suffixed** (`judge` → `judge-2`) instead of silently impersonating them, and
+every reattach is announced so the agent notices if it took the wrong name. A live
+holder can only be seized with `takeover:true` + the credential. Identities created
+before v3 stay open until their first reattach, which upgrades them with a scope + token.
 
 ## v2 features
 

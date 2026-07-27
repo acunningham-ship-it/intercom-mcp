@@ -1,10 +1,24 @@
 #!/usr/bin/env node
-// intercom-mcp v2 — inter-session message bus for agents on one box.
+// intercom-mcp v3 — inter-session message bus for agents on one box.
 //
-// v2 adds: presence heartbeat (live/idle/stale status on who()), read-state
+// v2 added: presence heartbeat (live/idle/stale status on who()), read-state
 // (send shows recipient last_active; history shows per-message read receipts),
 // topic routing (join with topics:[], send with topic: broadcasts to subscribers
 // only), and inbox filters (from_agent / topic on inbox()).
+//
+// v3 (R4) adds PERSISTENT IDENTITY. A row in `agents` is now a DURABLE identity —
+// name, role, topics, memory_scope and a token that survive across reboots — not a
+// live process. Liveness (pid/pid_start) only marks whether a session is currently
+// attached. join() became sign-in: a fresh process re-attaches to its existing
+// identity (role/topics restored) instead of starting blank. Dead rows are NOT
+// deleted; they go offline (still addressable — messages queue) and age out only via
+// pruneIdentities (INTERCOM_IDENTITY_TTL_DAYS, default 30).
+//
+// Impersonation guardrail — NOT auth. This is a single-user box; any of the user's
+// own processes can read any token file, so nothing here is cryptographic. It exists
+// to catch ACCIDENTS (a mistyped sign_in name), not adversaries: reattaching an
+// offline identity is allowed from its own memory_scope (cwd) or with its token, and
+// every reattach is ANNOUNCED so the agent notices if it grabbed the wrong name.
 //
 // Each agent session spawns its own stdio instance of this server; all instances
 // share one SQLite database (WAL mode). No daemon, no port. Delivery is durable:
@@ -14,7 +28,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, join as pathJoin } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -66,6 +81,9 @@ for (const col of [
   "topics TEXT",    // v2: JSON array of topic strings; NULL = receive all broadcasts
   "pid_start TEXT", // v3: process start-time token from /proc/<pid>/stat field 22
   "status TEXT",    // v3 Lane B: short status string set via update_status (e.g. "working", "done")
+  "memory_scope TEXT", // R4: boot dir this identity belongs to (its ambient credential)
+  "token TEXT",        // R4: reattach token, minted at creation (accident-guardrail, not auth)
+  "left_at TEXT",      // R4: when the current session detached; NULL = attached/never-left
 ]) {
   try { db.exec(`ALTER TABLE agents ADD COLUMN ${col}`); } catch {}
 }
@@ -116,6 +134,20 @@ function pruneOld() {
   db.exec("DELETE FROM reads WHERE message_id NOT IN (SELECT id FROM messages)");
 }
 pruneOld();
+
+// R4: age out durable identities that have been OFFLINE longer than the TTL, so
+// one-off `<cwd>-<pid>` seats don't accumulate forever. Named roles that sign in
+// within the window survive; a long-silent one re-mints cleanly on next sign-in.
+const IDENTITY_TTL_DAYS = Number(process.env.INTERCOM_IDENTITY_TTL_DAYS ?? 30);
+function pruneIdentities() {
+  if (!(IDENTITY_TTL_DAYS > 0)) return;
+  const cutoff = new Date(Date.now() - IDENTITY_TTL_DAYS * 86400000).toISOString();
+  const rows = db.prepare("SELECT name, pid, pid_start, last_seen FROM agents WHERE last_seen < ?").all(cutoff);
+  for (const r of rows) {
+    if (!agentAlive(r)) db.prepare("DELETE FROM agents WHERE name = ?").run(r.name);
+  }
+}
+pruneIdentities();
 
 // ---------------------------------------------------------------------------
 // identity & presence
@@ -182,83 +214,138 @@ function sanitizeName(name) {
   return name.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "-").slice(0, 48);
 }
 
-function registerAs(rawName, role, topics) {
+// R4 identity token: minted at creation, stashed 0600 under ~/.intercom/agents/.
+// It's a convenience credential for the owner to reattach from a different cwd —
+// NOT a secret (same-user processes can read the file). See the header note.
+const TOKENS_DIR = pathJoin(homedir(), ".intercom", "agents");
+const tokenPath = (name) => pathJoin(TOKENS_DIR, `${name}.token`);
+const mintToken = () => randomBytes(9).toString("hex");
+function writeTokenFile(name, token) {
+  try {
+    mkdirSync(TOKENS_DIR, { recursive: true });
+    writeFileSync(tokenPath(name), token, { mode: 0o600 });
+    chmodSync(tokenPath(name), 0o600);
+  } catch {}
+}
+
+// Any row (online or offline) — a durable identity lookup.
+const identityRow = (name) => db.prepare("SELECT * FROM agents WHERE name = ?").get(name);
+// Every identity, newest-joined last. No mutation (unlike the old onlineAgents).
+const allIdentities = () => db.prepare("SELECT * FROM agents ORDER BY joined_at").all();
+// Currently-attached identities only. Non-destructive: offline rows are LEFT in place.
+const onlineAgents = () => allIdentities().filter(agentAlive);
+
+// The accident-guardrail (NOT auth — see header). An offline identity may be
+// reattached from its own boot scope (cwd == memory_scope), or by explicitly
+// passing its token. The token is NOT auto-read from the stashed file — that file
+// is the owner's recovery copy to look up and pass, not an ambient credential
+// (any same-user process could read it, which would make the guardrail theater).
+// Legacy rows (pre-R4, no scope AND no token) stay open for backward-compat.
+function credentialOk(row, cwd, token) {
+  if (row.memory_scope && cwd === row.memory_scope) return true; // same boot scope
+  if (row.token && token && token === row.token) return true;    // explicit token override
+  if (!row.token && !row.memory_scope) return true;              // legacy backward-compat
+  return false;
+}
+
+// sign_in: attach this process to the named identity, creating it if new.
+// Returns { name, status: new|rejoin|reattach|takeover, token, restored }.
+// role/topics/memory_scope/token/joined_at all persist across reboots.
+function signIn(rawName, opts = {}) {
+  const { role, topics, memoryScope, token, takeover } = opts;
   const baseName = sanitizeName(rawName) || `agent-${process.pid}`;
-  // topics: null if not passed (COALESCE preserves existing); JSON string if provided.
   const topicsJson = Array.isArray(topics) ? JSON.stringify(topics) : null;
-  // Wrap find-free-name + insert in a single IMMEDIATE transaction so two concurrent
-  // sessions racing on the same name can't both pass the "is it free?" check.
-  // Retry up to MAX_RETRIES suffix variants; final fallback is process-unique.
-  // pid_start (process start-time token) is captured so presence survives PID reuse.
   const pidStart = processStartToken(process.pid);
+  const cwd = process.cwd();
+  const scope = memoryScope ?? cwd;
   const MAX_RETRIES = 50;
+
+  // Reattach/rejoin update — preserves the identity's durable fields.
+  const REATTACH = `UPDATE agents SET pid = ?, pid_start = ?, cwd = ?, role = COALESCE(?, role),
+       last_seen = ?, tmux_socket = NULL, tmux_pane = NULL,
+       topics = COALESCE(?, topics), left_at = NULL WHERE name = ?`;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     const candidate =
       attempt === 0            ? baseName
       : attempt < MAX_RETRIES ? `${baseName}-${attempt + 1}`
       :                         `${baseName}-${process.pid}`;
-
+    let result;
     try {
       db.exec("BEGIN IMMEDIATE");
       const ts = now();
-      const holder = db
-        .prepare("SELECT pid FROM agents WHERE name = ?")
-        .get(candidate);
+      const row = db.prepare("SELECT * FROM agents WHERE name = ?").get(candidate);
 
-      if (!holder) {
-        // Name is unclaimed — insert fresh.
+      if (!row) {
+        // New identity — mint a token, record the boot scope.
+        const newToken = mintToken();
         db.prepare(
-          `INSERT INTO agents (name, pid, pid_start, cwd, role, joined_at, last_seen, tmux_socket, tmux_pane, topics)
-           VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)`
-        ).run(candidate, process.pid, pidStart, process.cwd(), role ?? null, ts, ts, topicsJson);
+          `INSERT INTO agents (name, pid, pid_start, cwd, role, joined_at, last_seen,
+             tmux_socket, tmux_pane, topics, memory_scope, token, left_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, NULL)`
+        ).run(candidate, process.pid, pidStart, cwd, role ?? null, ts, ts, topicsJson, scope, newToken);
         db.exec("COMMIT");
-      } else if (holder.pid === process.pid || !pidAlive(holder.pid)) {
-        // Same-process re-join or dead holder — update in place; preserve joined_at.
-        db.prepare(
-          `UPDATE agents SET pid = ?, pid_start = ?, cwd = ?, role = COALESCE(?, role),
-           last_seen = ?, tmux_socket = NULL, tmux_pane = NULL,
-           topics = COALESCE(?, topics) WHERE name = ?`
-        ).run(process.pid, pidStart, process.cwd(), role ?? null, ts, topicsJson, candidate);
+        writeTokenFile(candidate, newToken);
+        result = { name: candidate, status: "new", token: newToken, restored: null };
+      } else if (row.pid === process.pid) {
+        // Same-process re-call (rename/update) — no credential needed.
+        db.prepare(REATTACH).run(process.pid, pidStart, cwd, role ?? null, ts, topicsJson, candidate);
         db.exec("COMMIT");
+        result = { name: candidate, status: "rejoin", token: row.token, restored: null };
+      } else if (!agentAlive(row)) {
+        // Offline identity — the reboot path. Gate on the accident-guardrail.
+        if (!credentialOk(row, cwd, token) && !takeover) {
+          db.exec("ROLLBACK");
+          continue; // a different agent grabbing an offline name → suffix instead
+        }
+        db.prepare(REATTACH).run(process.pid, pidStart, cwd, role ?? null, ts, topicsJson, candidate);
+        // Upgrade a legacy (pre-R4) identity in place: give it a scope + token now, so
+        // identities that predate this feature gain the guardrail on their first reboot
+        // instead of staying permanently open until the TTL prune.
+        let outToken = row.token;
+        if (!row.memory_scope && !row.token) {
+          outToken = mintToken();
+          db.prepare("UPDATE agents SET memory_scope = ?, token = ? WHERE name = ?").run(cwd, outToken, candidate);
+        }
+        db.exec("COMMIT");
+        if (outToken !== row.token) writeTokenFile(candidate, outToken);
+        result = { name: candidate, status: "reattach", token: outToken,
+                   restored: { role: row.role, topics: row.topics },
+                   upgraded: outToken !== row.token };
       } else {
-        // Live different-pid holder — cannot claim; suffix and retry.
-        db.exec("ROLLBACK");
-        continue;
+        // Live different-pid holder — only takeover + credential may seize it.
+        if (takeover && credentialOk(row, cwd, token)) {
+          db.prepare(REATTACH).run(process.pid, pidStart, cwd, role ?? null, ts, topicsJson, candidate);
+          db.exec("COMMIT");
+          result = { name: candidate, status: "takeover", token: row.token,
+                     restored: { role: row.role, topics: row.topics } };
+        } else {
+          db.exec("ROLLBACK");
+          continue; // suffix and retry
+        }
       }
     } catch (err) {
       try { db.exec("ROLLBACK"); } catch {}
       throw err;
     }
 
-    // Claimed successfully — drop our previous name if we renamed mid-session.
-    if (me && me !== candidate) {
-      db.prepare("DELETE FROM agents WHERE name = ? AND pid = ?").run(me, process.pid);
+    // Renamed mid-session — mark our previous identity offline (durable, not deleted).
+    if (me && me !== result.name) {
+      db.prepare("UPDATE agents SET left_at = ? WHERE name = ? AND pid = ?").run(now(), me, process.pid);
     }
-    me = candidate;
-    return candidate;
+    me = result.name;
+    return result;
   }
 
-  // Unreachable: the process.pid fallback at attempt === MAX_RETRIES is always unique.
-  throw new Error("registerAs: exhausted all suffix attempts");
+  throw new Error("signIn: exhausted all suffix attempts");
 }
 
 function ensureJoined() {
   if (me) {
-    db.prepare("UPDATE agents SET last_seen = ? WHERE name = ?").run(now(), me);
+    db.prepare("UPDATE agents SET last_seen = ?, left_at = NULL WHERE name = ?").run(now(), me);
     return me;
   }
-  return registerAs(`${basename(process.cwd()) || "agent"}-${process.pid % 10000}`);
-}
-
-function onlineAgents() {
-  const rows = db.prepare("SELECT * FROM agents ORDER BY joined_at").all();
-  const online = [];
-  for (const a of rows) {
-    if (agentAlive(a)) online.push(a);
-    else db.prepare("DELETE FROM agents WHERE name = ?").run(a.name);
-  }
-  return online;
+  return signIn(`${basename(process.cwd()) || "agent"}-${process.pid % 10000}`).name;
 }
 
 // ---------------------------------------------------------------------------
@@ -328,26 +415,27 @@ const text = (s) => ({ content: [{ type: "text", text: s }] });
 // server & tools
 
 const server = new McpServer(
-  { name: "intercom", version: "0.2.0" },
+  { name: "intercom", version: "0.3.0" },
   {
     instructions: `Message bus between agent sessions (Claude Code, Codex, or any MCP client) running on this machine.
 Start by calling join with a short descriptive name (e.g. the project you're working on).
-- send: fire-and-forget message to one agent or broadcast to all. Add topic to route to subscribers only.
+Identities are DURABLE (v3): reuse the same name across reboots and your role/topics come back — join reattaches your existing identity instead of starting blank.
+- send: fire-and-forget message to one agent or broadcast to all. Add topic to route to subscribers only. You can send to an OFFLINE identity — it queues and delivers on their next sign-in.
 - ask: send a question and BLOCK until the recipient replies (or timeout). The question stays queued if they're busy.
 - inbox: fetch your unread messages; pass wait_seconds to long-poll, from_agent/topic to filter.
 - reply: answer a question or respond to a message by id.
-- who: list online sessions with live/idle/stale presence status and last_active time.
+- who: list online sessions with live/idle/stale presence; pass include_offline to also see durable identities that are currently offline.
 Delivery: on join, arm a Monitor on monitor-watcher.js for clean event-based notifications (call inbox when it fires). Messages are never typed into your terminal. Delivery is durable: anything you miss is still in your inbox. If collaborating, also check inbox between tasks.`,
   }
 );
 
 server.tool(
   "join",
-  "Join the intercom under a name so other Claude Code sessions can find and message you. Call this first. Re-call to rename or update topic subscriptions.",
+  "Sign in to the intercom under a name so other sessions can find and message you. Call this first. Identities are DURABLE: re-calling from a fresh process reattaches your existing identity (role/topics restored) rather than starting blank. Re-call to rename or update subscriptions.",
   {
     name: z
       .string()
-      .describe("Short kebab-case name, e.g. 'lead-engine' or 'reviewer'"),
+      .describe("Short kebab-case name, e.g. 'lead-engine' or 'reviewer'. Reuse the same name across reboots to keep one identity."),
     role: z
       .string()
       .optional()
@@ -359,13 +447,43 @@ server.tool(
         "Topic tags to subscribe to (e.g. ['alerts', 'rmi']). Omit to receive all broadcasts. " +
         "If set, you only receive topic-tagged broadcasts for your subscribed topics; non-topic broadcasts still reach you."
       ),
+    token: z
+      .string()
+      .optional()
+      .describe("Identity token (from the first sign-in). Only needed to reattach an existing identity from a DIFFERENT cwd than it was created in."),
+    memory_scope: z
+      .string()
+      .optional()
+      .describe("Boot dir this identity belongs to. Defaults to cwd. Reattaching from this scope needs no token (accident-guardrail, not auth)."),
+    takeover: z
+      .boolean()
+      .optional()
+      .describe("Seize the name even if a live session currently holds it (requires the token or matching scope). Use only when reclaiming a wedged session."),
   },
-  async ({ name, role, topics }) => {
-    const assigned = registerAs(name, role, topics);
+  async ({ name, role, topics, token, memory_scope, takeover }) => {
+    const r = signIn(name, { role, topics, token, memoryScope: memory_scope, takeover });
+    const assigned = r.name;
     const others = onlineAgents().filter((a) => a.name !== assigned);
     const unread = unreadFor(assigned).length;
     let out = `joined as "${assigned}"`;
-    if (assigned !== sanitizeName(name)) out += ` (requested name was taken by a live session)`;
+    if (r.status === "new") out += " (new identity)";
+    else if (r.status === "reattach") out += " (reattached to your offline identity)";
+    else if (r.status === "takeover") out += " (took over the live holder)";
+    if (assigned !== sanitizeName(name)) {
+      out += ` — requested "${sanitizeName(name)}" is held by another live session or a different-scope identity; you were given a distinct name. To reattach it, sign in from its scope or pass its token.`;
+    }
+    if (r.status === "reattach" || r.status === "takeover") {
+      const rt = r.restored || {};
+      const tp = rt.topics ? `, topics: ${JSON.parse(rt.topics).join(",")}` : "";
+      out += `\nrestored — role: ${rt.role ?? "(none)"}${tp}`;
+      out += `\n⚠ you attached to an EXISTING identity. if you are not "${assigned}", sign in under a different name.`;
+      if (r.upgraded) {
+        out += `\nthis identity predated persistent-identity; it's now scoped to ${process.cwd()} and issued token ${r.token} (saved 0600 to ${tokenPath(assigned)}) — needed only to reattach from another cwd.`;
+      }
+    }
+    if (r.status === "new") {
+      out += `\nidentity token: ${r.token}  (saved 0600 to ${tokenPath(assigned)}) — needed only to reattach from a cwd other than ${process.cwd()}.`;
+    }
     out += others.length
       ? `\nonline now: ${others
           .map((a) => `${a.name}${a.role ? ` (${a.role})` : ""}`)
@@ -390,20 +508,32 @@ server.tool(
       .boolean()
       .optional()
       .describe("If true, only show live/idle agents (hide stale agents not seen in 5+ minutes)"),
+    include_offline: z
+      .boolean()
+      .optional()
+      .describe("Also list durable identities that are currently offline. They still receive queued messages — you can send to them and they get it on next sign-in."),
   },
-  async ({ active_only }) => {
+  async ({ active_only, include_offline }) => {
     ensureJoined();
     let agents = onlineAgents();
     if (active_only) agents = agents.filter((a) => statusLabel(a.last_seen) !== "stale");
-    if (!agents.length) {
-      return text(active_only ? "no active (live/idle) agents online." : "nobody online (not even you — this shouldn't happen)");
-    }
     const lines = agents.map((a) => {
       const presence = statusLabel(a.last_seen);
       const statusStr = a.status ? ` status:${a.status}` : "";
       const topicsStr = a.topics ? ` topics:[${JSON.parse(a.topics).join(",")}]` : "";
       return `- ${a.name}${a.name === me ? " (you)" : ""}${a.role ? ` — ${a.role}` : ""} · cwd ${a.cwd} · last_active ${ago(a.last_seen)} [${presence}]${statusStr}${topicsStr}`;
     });
+    if (include_offline) {
+      const onlineNames = new Set(agents.map((a) => a.name));
+      const offline = allIdentities().filter((a) => !onlineNames.has(a.name) && !agentAlive(a));
+      for (const a of offline) {
+        const topicsStr = a.topics ? ` topics:[${JSON.parse(a.topics).join(",")}]` : "";
+        lines.push(`- ${a.name}${a.role ? ` — ${a.role}` : ""} · scope ${a.memory_scope ?? a.cwd ?? "?"} · [offline · last seen ${ago(a.last_seen)}]${topicsStr}`);
+      }
+    }
+    if (!lines.length) {
+      return text(active_only ? "no active (live/idle) agents online." : "nobody online (not even you — this shouldn't happen)");
+    }
     return text(lines.join("\n"));
   }
 );
@@ -436,10 +566,13 @@ server.tool(
   async ({ message, to, topic, max_claims }) => {
     ensureJoined();
     if (to) {
-      const known = onlineAgents().map((a) => a.name);
-      if (!known.includes(to)) {
+      // A known identity is a valid recipient even when offline — the message queues
+      // and is delivered on its next sign-in. Only reject a name nobody has ever used.
+      if (!identityRow(to)) {
+        const known = onlineAgents().map((a) => a.name).filter((n) => n !== me);
         return text(
-          `no online agent named "${to}". online: ${known.filter((n) => n !== me).join(", ") || "(nobody else)"}.\nmessage NOT sent — retry with a valid name or omit 'to' to broadcast.`
+          `no identity named "${to}". online: ${known.join(", ") || "(nobody else)"}.\n` +
+          `message NOT sent — retry with a valid name (who include_offline for offline ones) or omit 'to' to broadcast.`
         );
       }
     }
@@ -450,10 +583,12 @@ server.tool(
     }
     let out = `sent #${id} ${to ? `to ${to}` : "as broadcast"}${topic ? ` [topic:${topic}]` : ""}${max_claims && !to ? ` [claimable:${max_claims}]` : ""}.`;
     if (to) {
-      // Read-state: show recipient's last_active so sender knows if they're around.
-      const recip = db.prepare("SELECT last_seen FROM agents WHERE name = ?").get(to);
-      if (recip) {
+      // Read-state: show recipient's last_active, or flag that it's queued for an offline identity.
+      const recip = db.prepare("SELECT last_seen, pid, pid_start FROM agents WHERE name = ?").get(to);
+      if (recip && agentAlive(recip)) {
         out += ` recipient last_active ${ago(recip.last_seen)} [${statusLabel(recip.last_seen)}].`;
+      } else if (recip) {
+        out += ` recipient is OFFLINE (last seen ${ago(recip.last_seen)}) — queued, delivered on next sign-in.`;
       }
     } else if (topic) {
       out += ` only subscribers of "${topic}" will see this.`;
@@ -998,7 +1133,9 @@ server.tool(
 
 process.on("exit", () => {
   try {
-    if (me) db.prepare("DELETE FROM agents WHERE name = ? AND pid = ?").run(me, process.pid);
+    // R4: don't delete — mark the identity offline. It stays addressable (messages
+    // queue) and is reattached on next sign-in; pruneIdentities ages it out later.
+    if (me) db.prepare("UPDATE agents SET left_at = ? WHERE name = ? AND pid = ?").run(now(), me, process.pid);
     db.close();
   } catch {}
 });
