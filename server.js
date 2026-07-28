@@ -431,6 +431,7 @@ Start by calling join with a short descriptive name (e.g. the project you're wor
 Identities are DURABLE (v3): reuse the same name across reboots and your role/topics come back — join reattaches your existing identity instead of starting blank.
 - send: fire-and-forget message to one agent or broadcast to all. Add topic to route to subscribers only. You can send to an OFFLINE identity — it queues and delivers on their next sign-in.
 - ask: send a question and BLOCK until the recipient replies (or timeout). The question stays queued if they're busy.
+- ask_async / wait_for_any: fire questions WITHOUT blocking (each returns its #id), then wait_for_any([ids]) for whichever answers first — fan-out coordination.
 - inbox: fetch your unread messages; pass wait_seconds to long-poll, from_agent/topic to filter.
 - reply: answer a question or respond to a message by id.
 - who: list online sessions with live/idle/stale presence; pass include_offline to also see durable identities that are currently offline.
@@ -682,6 +683,75 @@ server.tool(
       : "";
     return text(
       `no answer after ${waited}s. question #${qid} is still queued for ${to ?? "everyone"} — they'll see it on their next inbox check. check your inbox later for the answer (it will arrive as an 'answer' referencing #${qid}).${staleNote}`
+    );
+  }
+);
+
+server.tool(
+  "ask_async",
+  "Fire a question WITHOUT blocking — returns the question #id immediately. The answer lands in your inbox (as an 'answer' referencing that #id), or you can wait_for_any([id]) for it later. Use to fan out several questions in parallel, then wait_for_any for whichever answers first. Unlike ask(), this never blocks. An offline recipient still gets it on next sign-in.",
+  {
+    question: z.string().describe("The question to ask"),
+    to: z
+      .string()
+      .optional()
+      .describe("Agent to ask. Omit to broadcast — any agent can answer."),
+  },
+  async ({ question, to }) => {
+    ensureJoined();
+    if (to && !identityRow(to)) {
+      const others = onlineAgents().map((a) => a.name).filter((n) => n !== me);
+      return text(
+        `no identity named "${to}". online: ${others.join(", ") || "(nobody else)"}. question NOT sent.`
+      );
+    }
+    const qid = insertMessage({ to, kind: "question", body: question });
+    return text(
+      `asked #${qid}${to ? ` to ${to}` : " (broadcast)"} — non-blocking. ` +
+      `the answer lands in your inbox referencing #${qid}, or call wait_for_any(question_ids: [${qid}]) to block for it.`
+    );
+  }
+);
+
+server.tool(
+  "wait_for_any",
+  "Block until the FIRST answer to any of the given question #ids arrives (or timeout). Pair with ask_async: fan out N questions, then wait_for_any for whichever replies first. Returns the answer + which question it answered. On timeout the questions stay queued and their answers still land in your inbox.",
+  {
+    question_ids: z
+      .array(z.number().int())
+      .min(1)
+      .describe("The #ids returned by ask_async (or ask) to wait on."),
+    timeout_seconds: z
+      .number()
+      .int()
+      .min(1)
+      .max(240)
+      .optional()
+      .describe("How long to wait for the first answer (default 60)."),
+  },
+  async ({ question_ids, timeout_seconds }) => {
+    ensureJoined();
+    const timeout = (timeout_seconds ?? 60) * 1000;
+    const deadline = Date.now() + timeout;
+    const placeholders = question_ids.map(() => "?").join(",");
+    // Only answers to MY questions (addressed to me, or a broadcast answer) count — an
+    // answer's to_agent is set to the original asker by reply(), so this can't return
+    // an answer meant for someone else even if an unrelated #id is passed.
+    const stmt = db.prepare(
+      `SELECT * FROM messages WHERE kind = 'answer' AND reply_to IN (${placeholders})
+         AND (to_agent = ? OR to_agent IS NULL) ORDER BY id LIMIT 1`
+    );
+    while (Date.now() < deadline) {
+      const answer = stmt.get(...question_ids, me);
+      if (answer) {
+        markRead(me, [answer.id]);
+        return text(`${answer.from_agent} answered question #${answer.reply_to}:\n${answer.body}`);
+      }
+      await sleep(400);
+    }
+    return text(
+      `no answer to any of #${question_ids.join(", #")} after ${Math.round(timeout / 1000)}s. ` +
+      `still queued — answers will land in your inbox referencing their question #id.`
     );
   }
 );
