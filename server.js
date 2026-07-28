@@ -90,6 +90,9 @@ for (const col of [
 for (const col of [
   "topic TEXT",      // v2: topic tag on a message; NULL = no topic
   "max_claims INTEGER", // r2-a: if set, broadcast is claimable by up to N agents
+  "type TEXT",       // R3: structured message type for typed routing (e.g. 'task','status','alert')
+  "payload TEXT",    // R3: JSON payload string carried alongside a typed message
+  "expires_at TEXT", // R3: ISO expiry; after it the message is [STALE] and drops out of unread
 ]) {
   try { db.exec(`ALTER TABLE messages ADD COLUMN ${col}`); } catch {}
 }
@@ -351,13 +354,16 @@ function ensureJoined() {
 // ---------------------------------------------------------------------------
 // messages
 
-function insertMessage({ to, kind, body, replyTo, topic }) {
+function insertMessage({ to, kind, body, replyTo, topic, type, payload, expiresAt }) {
   const res = db
     .prepare(
-      `INSERT INTO messages (from_agent, to_agent, kind, body, reply_to, created_at, topic)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO messages (from_agent, to_agent, kind, body, reply_to, created_at, topic, type, payload, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
-    .run(me, to ?? null, kind, body, replyTo ?? null, now(), topic ?? null);
+    .run(me, to ?? null, kind, body, replyTo ?? null, now(), topic ?? null,
+         type ?? null,
+         payload == null ? null : (typeof payload === "string" ? payload : JSON.stringify(payload)),
+         expiresAt ?? null);
 
   const msgId = Number(res.lastInsertRowid);
 
@@ -380,8 +386,8 @@ function insertMessage({ to, kind, body, replyTo, topic }) {
 //
 // filters.from  — only show messages from this agent name
 // filters.topic — only show messages tagged with this topic
-function unreadFor(agent, { from, topic } = {}) {
-  return unreadForShared(db, agent, { from, topic });
+function unreadFor(agent, { from, topic, type } = {}) {
+  return unreadForShared(db, agent, { from, topic, type });
 }
 
 function markRead(agent, ids) {
@@ -397,15 +403,18 @@ function markRead(agent, ids) {
 function fmtMessage(m) {
   const to = m.to_agent ? `to ${m.to_agent}` : "broadcast";
   const topicTag = m.topic ? ` [topic:${m.topic}]` : "";
+  const typeTag = m.type ? ` <${m.type}>` : "";
+  const staleTag = m.expires_at && m.expires_at < now() ? " [STALE]" : "";
   const replyPrefix = m.reply_to ? `↩ #${m.reply_to} ` : "";
-  let line = `[#${m.id}] ${m.from_agent} → ${to}${topicTag} (${m.kind}, ${ago(m.created_at)}): ${replyPrefix}${m.body}`;
+  let line = `[#${m.id}]${staleTag} ${m.from_agent} → ${to}${topicTag}${typeTag} (${m.kind}, ${ago(m.created_at)}): ${replyPrefix}${m.body}`;
   if (m.kind === "question") {
     line += `\n      ↳ answer with reply(message_id: ${m.id}, message: "...")`;
   }
   if (m.kind === "answer" && m.reply_to) {
     // For answers, use the special format but preserve reply_to prefix if present.
-    line = `[#${m.id}] ${m.from_agent} answered your question ${replyPrefix}#${m.reply_to}${topicTag} (${ago(m.created_at)}): ${m.body}`;
+    line = `[#${m.id}]${staleTag} ${m.from_agent} answered your question ${replyPrefix}#${m.reply_to}${topicTag}${typeTag} (${ago(m.created_at)}): ${m.body}`;
   }
+  if (m.payload) line += `\n      payload: ${m.payload}`;
   return line;
 }
 
@@ -540,7 +549,7 @@ server.tool(
 
 server.tool(
   "send",
-  "Send a fire-and-forget message to another session (or broadcast to all). Add topic to route the broadcast only to subscribed agents. Add max_claims to make a broadcast claimable (first N agents to call claim() get it; others are told it's full).",
+  "Send a fire-and-forget message to another session (or broadcast to all). Add topic to route the broadcast only to subscribed agents. Add max_claims to make a broadcast claimable. Add type + payload for a structured message (typed routing — recipients can filter inbox(type:...)). Add ttl_seconds to expire it: after that it shows [STALE] and drops out of unread.",
   {
     message: z.string().describe("The message body"),
     to: z
@@ -553,6 +562,20 @@ server.tool(
       .describe(
         "Topic tag (e.g. 'alerts'). When broadcasting, only agents subscribed to this topic will receive it."
       ),
+    type: z
+      .string()
+      .optional()
+      .describe("Structured message type for typed routing, e.g. 'task', 'status', 'result', 'alert'. Recipients can pull just this type with inbox(type: ...)."),
+    payload: z
+      .any()
+      .optional()
+      .describe("Structured data to carry with the message (JSON object/array, or a string). Stored verbatim and shown under the message. Pair with type."),
+    ttl_seconds: z
+      .number()
+      .int()
+      .min(1)
+      .optional()
+      .describe("Time-to-live: after this many seconds the message is [STALE] and no longer counts as unread. For time-sensitive coordination that shouldn't nag a recipient who missed the window."),
     max_claims: z
       .number()
       .int()
@@ -563,7 +586,7 @@ server.tool(
         "Others get 'full — already claimed by X, Y'. Only valid on broadcasts (no 'to')."
       ),
   },
-  async ({ message, to, topic, max_claims }) => {
+  async ({ message, to, topic, type, payload, ttl_seconds, max_claims }) => {
     ensureJoined();
     if (to) {
       // A known identity is a valid recipient even when offline — the message queues
@@ -576,12 +599,13 @@ server.tool(
         );
       }
     }
-    const id = insertMessage({ to, kind: "message", body: message, topic });
+    const expiresAt = ttl_seconds ? new Date(Date.now() + ttl_seconds * 1000).toISOString() : null;
+    const id = insertMessage({ to, kind: "message", body: message, topic, type, payload, expiresAt });
     // Store max_claims if set (broadcasts only — silently ignore on directed sends).
     if (max_claims && !to) {
       db.prepare("UPDATE messages SET max_claims = ? WHERE id = ?").run(max_claims, id);
     }
-    let out = `sent #${id} ${to ? `to ${to}` : "as broadcast"}${topic ? ` [topic:${topic}]` : ""}${max_claims && !to ? ` [claimable:${max_claims}]` : ""}.`;
+    let out = `sent #${id} ${to ? `to ${to}` : "as broadcast"}${topic ? ` [topic:${topic}]` : ""}${type ? ` <${type}>` : ""}${ttl_seconds ? ` [ttl:${ttl_seconds}s]` : ""}${max_claims && !to ? ` [claimable:${max_claims}]` : ""}.`;
     if (to) {
       // Read-state: show recipient's last_active, or flag that it's queued for an offline identity.
       const recip = db.prepare("SELECT last_seen, pid, pid_start FROM agents WHERE name = ?").get(to);
@@ -719,6 +743,10 @@ server.tool(
       .string()
       .optional()
       .describe("Only show messages tagged with this topic"),
+    type: z
+      .string()
+      .optional()
+      .describe("Only show structured messages of this type (see send's type param, e.g. 'task', 'result')"),
     kind: z
       .string()
       .optional()
@@ -728,9 +756,9 @@ server.tool(
       .optional()
       .describe("If true, return just the integer count of unread messages — no bodies, no mark-as-read (cheap peek to decide whether to call inbox)"),
   },
-  async ({ wait_seconds, from_agent, topic, kind, unread_count }) => {
+  async ({ wait_seconds, from_agent, topic, type, kind, unread_count }) => {
     ensureJoined();
-    const filters = { from: from_agent, topic };
+    const filters = { from: from_agent, topic, type };
 
     // unread_count: non-destructive peek — count only, no mark-as-read, no waiting.
     if (unread_count) {
@@ -739,6 +767,7 @@ server.tool(
       const filterDesc = [
         from_agent && `from:${from_agent}`,
         topic && `topic:${topic}`,
+        type && `type:${type}`,
         kind && `kind:${kind}`,
       ].filter(Boolean).join(", ");
       return text(`${msgs.length} unread${filterDesc ? ` (filter: ${filterDesc})` : ""}.`);
@@ -756,6 +785,7 @@ server.tool(
       const filterDesc = [
         from_agent && `from:${from_agent}`,
         topic && `topic:${topic}`,
+        type && `type:${type}`,
         kind && `kind:${kind}`,
       ].filter(Boolean).join(", ");
       return text(

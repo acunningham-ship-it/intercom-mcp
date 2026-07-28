@@ -8,7 +8,12 @@
 // Optional filters:
 //   opts.from  — only messages from this agent
 //   opts.topic — only messages tagged with this topic
-export function unreadFor(db, agent, { from, topic } = {}) {
+//   opts.type  — only messages of this structured type (R3 typed routing)
+//
+// R3 TTL: an expired message (expires_at in the past) is excluded from unread — a
+// time-sensitive message that missed its window shouldn't nag. It's still in the db
+// (history/get_message show it tagged [STALE]); it just stops counting as unread.
+export function unreadFor(db, agent, { from, topic, type } = {}) {
   let sql = `SELECT m.* FROM messages m
     WHERE m.from_agent != ?
       AND (m.to_agent = ? OR m.to_agent IS NULL)
@@ -18,6 +23,8 @@ export function unreadFor(db, agent, { from, topic } = {}) {
 
   if (from) { sql += ` AND m.from_agent = ?`; params.push(from); }
   if (topic) { sql += ` AND m.topic = ?`; params.push(topic); }
+  if (type) { sql += ` AND m.type = ?`; params.push(type); }
+  sql += ` AND (m.expires_at IS NULL OR m.expires_at > ?)`; params.push(new Date().toISOString());
   sql += ` ORDER BY m.id`;
 
   let msgs = db.prepare(sql).all(...params);

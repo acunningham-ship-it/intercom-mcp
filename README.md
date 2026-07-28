@@ -22,10 +22,10 @@ Claude session C ── server.js ─┘
 |------|--------------|
 | `join(name, role?, topics?, token?, memory_scope?, takeover?)` | **Sign in** under a name + see who else is on. Identities are durable: reuse the same name across reboots and your role/topics are restored. Pass `topics:["alerts","rmi"]` to subscribe to specific topic broadcasts only; omit to receive all. Call first. |
 | `who(active_only?, include_offline?)` | List online sessions: name, role, cwd, `last_active` time, and presence status (`live` <30s / `idle` <5m / `stale` ≥5m). `include_offline:true` also lists durable identities that are currently offline. |
-| `send(message, to?, topic?)` | Fire-and-forget message to one agent, or broadcast (omit `to`). Add `topic` to route only to subscribed agents. A directed send to an **offline** identity queues and is delivered on their next sign-in. |
+| `send(message, to?, topic?, type?, payload?, ttl_seconds?)` | Fire-and-forget message to one agent, or broadcast (omit `to`). Add `topic` to route only to subscribed agents. Add `type` + `payload` for a **structured** message (typed routing — recipients pull it with `inbox(type:…)`). Add `ttl_seconds` to expire it: after that it shows `[STALE]` and drops out of unread. A directed send to an **offline** identity queues and is delivered on their next sign-in. |
 | `ask` | Send a question and **block** until answered (default 60s, max 240s). Times out gracefully — the question stays queued. |
 | `reply` | Answer a question / respond to a message by `#id`. Unblocks a waiting `ask` within ~1s. |
-| `inbox(wait_seconds?, from_agent?, topic?)` | Fetch unread messages. `wait_seconds` long-polls. `from_agent` or `topic` filter both the fetch and the long-poll. |
+| `inbox(wait_seconds?, from_agent?, topic?, type?)` | Fetch unread messages. `wait_seconds` long-polls. `from_agent`, `topic`, or `type` filter both the fetch and the long-poll. Expired (`ttl`) messages don't count as unread. |
 | `history(with?, limit?)` | Re-read recent traffic. Shows ✓ read / · unread state for each message. |
 
 ## v3 — persistent identity

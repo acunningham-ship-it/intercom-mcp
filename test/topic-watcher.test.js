@@ -47,7 +47,10 @@ db.exec(`
     body       TEXT NOT NULL,
     reply_to   INTEGER,
     created_at TEXT NOT NULL,
-    topic      TEXT
+    topic      TEXT,
+    type       TEXT,
+    payload    TEXT,
+    expires_at TEXT
   );
   CREATE TABLE IF NOT EXISTS reads (
     agent      TEXT NOT NULL,
