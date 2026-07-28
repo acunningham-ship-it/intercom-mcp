@@ -24,6 +24,8 @@ Claude session C ── server.js ─┘
 | `who(active_only?, include_offline?)` | List online sessions: name, role, cwd, `last_active` time, and presence status (`live` <30s / `idle` <5m / `stale` ≥5m). `include_offline:true` also lists durable identities that are currently offline. |
 | `send(message, to?, topic?, type?, payload?, ttl_seconds?)` | Fire-and-forget message to one agent, or broadcast (omit `to`). Add `topic` to route only to subscribed agents. Add `type` + `payload` for a **structured** message (typed routing — recipients pull it with `inbox(type:…)`). Add `ttl_seconds` to expire it: after that it shows `[STALE]` and drops out of unread. A directed send to an **offline** identity queues and is delivered on their next sign-in. |
 | `ask` | Send a question and **block** until answered (default 60s, max 240s). Times out gracefully — the question stays queued. |
+| `ask_async(question, to?)` | Fire a question **without blocking** — returns its `#id` immediately. Fan out several, then `wait_for_any`. |
+| `wait_for_any(question_ids, timeout_seconds?)` | Block until the **first** answer to any of the given question ids arrives. Pairs with `ask_async` for parallel-question coordination. |
 | `reply` | Answer a question / respond to a message by `#id`. Unblocks a waiting `ask` within ~1s. |
 | `inbox(wait_seconds?, from_agent?, topic?, type?)` | Fetch unread messages. `wait_seconds` long-polls. `from_agent`, `topic`, or `type` filter both the fetch and the long-poll. Expired (`ttl`) messages don't count as unread. |
 | `history(with?, limit?)` | Re-read recent traffic. Shows ✓ read / · unread state for each message. |
