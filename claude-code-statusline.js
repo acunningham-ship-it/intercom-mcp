@@ -11,6 +11,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { homedir } from "node:os";
 import { join as pathJoin } from "node:path";
+import { unreadFor } from "./unread.js";
 
 const args = process.argv.slice(2);
 const opt = (flag, def) => {
@@ -33,17 +34,11 @@ try {
   const db = new DatabaseSync(DB_PATH);
   db.exec("PRAGMA busy_timeout = 1000; PRAGMA journal_mode = WAL;");
 
-  // Count unread messages for this agent
-  const result = db
-    .prepare(
-      `SELECT COUNT(*) as unread FROM messages m
-       WHERE m.from_agent != ?
-         AND (m.to_agent = ? OR m.to_agent IS NULL)
-         AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.agent = ? AND r.message_id = m.id)`
-    )
-    .get(me, me, me);
-
-  const unreadCount = result?.unread || 0;
+  // Count unread messages for this agent — via the shared definition, so the badge
+  // can't disagree with inbox (this copy predated unread.js and already missed the
+  // kind!='response', TTL and topic-routing rules; the join-time broadcast floor
+  // would have widened that gap into a badge nobody can clear).
+  const unreadCount = unreadFor(db, me).length;
 
   if (unreadCount > 0) {
     const segment = {
