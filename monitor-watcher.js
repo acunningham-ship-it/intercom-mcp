@@ -6,9 +6,15 @@
 // poll interval without side effects.
 //
 // Usage:
-//   # Run under Claude Code's Monitor tool (both forms work; --me wins if both given)
+//   # Run under Claude Code's Monitor tool (all forms work)
 //   node /path/to/monitor-watcher.js <agent-name> [--interval 2]
 //   node /path/to/monitor-watcher.js --me <agent-name> [--interval 2]
+//   node /path/to/monitor-watcher.js --server-pid <mcp-pid> [--me <fallback-name>]
+//
+// --server-pid binds the watcher to a SESSION rather than to a name string: the
+// identity is re-resolved from the server every poll (session file, else the agents
+// row for that pid), so a rename follows automatically and the watcher can never
+// watch an identity its seat doesn't own. --me alone behaves exactly as before.
 //
 // Each line format:
 //   [<timestamp>] [<kind>] <count> new from <agents>
@@ -18,6 +24,7 @@
 // Each emission includes ALL unread messages in that cycle, grouped by sender.
 
 import { DatabaseSync } from "node:sqlite";
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join as pathJoin } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -40,9 +47,12 @@ const firstPositional = () => {
   return undefined;
 };
 
-const me = opt("--me", null) ?? firstPositional() ?? process.env.INTERCOM_NAME;
-if (!me) {
-  console.error("usage: node monitor-watcher.js <name> | --me <name> [--interval 2]");
+// Static fallback identity (old callers pass only this).
+const staticMe = opt("--me", null) ?? firstPositional() ?? process.env.INTERCOM_NAME;
+// Session binding: resolve the identity from the server owning this pid, every poll.
+const serverPid = Number(opt("--server-pid", 0)) || null;
+if (!staticMe && !serverPid) {
+  console.error("usage: node monitor-watcher.js <name> | --me <name> | --server-pid <pid> [--interval 2]");
   process.exit(2);
 }
 
@@ -53,8 +63,43 @@ const DB_PATH =
   process.env.INTERCOM_DB ??
   pathJoin(homedir(), ".local", "share", "intercom", "intercom.db");
 
+// Runtime dir shared with server.js (session identity files). Env-overridable so
+// tests never touch the live fleet's ~/.intercom.
+const RUN_DIR = process.env.INTERCOM_RUN_DIR ?? pathJoin(homedir(), ".intercom");
+const SESSION_FILE = serverPid ? pathJoin(RUN_DIR, "session", String(serverPid)) : null;
+
 let db = null;
+let me = staticMe;              // current resolved identity (re-resolved every poll)
 let lastSeen = new Set(); // ids we've already reported
+
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === "EPERM";
+  }
+}
+
+// Who does the seat that owns --server-pid currently call itself? Identity lives in
+// the server, not in our argv, so ask it each poll: session file first, agents row as
+// backstop. Falls back to --me when there's no session binding (old callers) or the
+// seat is gone.
+function resolveMe() {
+  if (serverPid && pidAlive(serverPid)) {
+    try {
+      const name = readFileSync(SESSION_FILE, "utf8").trim();
+      if (name) return name;
+    } catch {}
+    try {
+      const row = db
+        ?.prepare("SELECT name FROM agents WHERE pid = ? ORDER BY last_seen DESC LIMIT 1")
+        .get(serverPid);
+      if (row?.name) return row.name;
+    } catch {}
+  }
+  return staticMe;
+}
 
 function openDb() {
   try {
@@ -81,6 +126,7 @@ if (!openDb()) {
 }
 
 function getUnread() {
+  if (!me) return [];
   try {
     return unreadFor(db, me);
   } catch {
@@ -122,6 +168,7 @@ for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => {
 
 // Main loop: poll and emit on changes
 while (true) {
+  me = resolveMe();
   const messages = getUnread();
   const fresh = messages.filter((m) => !lastSeen.has(m.id));
 

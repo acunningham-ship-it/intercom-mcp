@@ -28,7 +28,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, chmodSync, unlinkSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, join as pathJoin } from "node:path";
@@ -217,10 +217,25 @@ function sanitizeName(name) {
   return name.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "-").slice(0, 48);
 }
 
+// Runtime dir for per-seat state (tokens, session identity files). Overridable so
+// tests stay hermetic instead of writing into the live fleet's ~/.intercom.
+const RUN_DIR = process.env.INTERCOM_RUN_DIR ?? pathJoin(homedir(), ".intercom");
+
+// Identity binding: the seat's CURRENT resolved name, keyed by this MCP server's pid.
+// The watcher re-reads this every poll instead of trusting a static --me argv string,
+// so a rename follows automatically and a watcher can't watch a name its seat doesn't own.
+const sessionPath = (pid) => pathJoin(RUN_DIR, "session", String(pid));
+function writeSessionFile(name) {
+  try {
+    mkdirSync(pathJoin(RUN_DIR, "session"), { recursive: true });
+    writeFileSync(sessionPath(process.pid), name);
+  } catch {}
+}
+
 // R4 identity token: minted at creation, stashed 0600 under ~/.intercom/agents/.
 // It's a convenience credential for the owner to reattach from a different cwd —
 // NOT a secret (same-user processes can read the file). See the header note.
-const TOKENS_DIR = pathJoin(homedir(), ".intercom", "agents");
+const TOKENS_DIR = pathJoin(RUN_DIR, "agents");
 const tokenPath = (name) => pathJoin(TOKENS_DIR, `${name}.token`);
 const mintToken = () => randomBytes(9).toString("hex");
 function writeTokenFile(name, token) {
@@ -337,6 +352,7 @@ function signIn(rawName, opts = {}) {
       db.prepare("UPDATE agents SET left_at = ? WHERE name = ? AND pid = ?").run(now(), me, process.pid);
     }
     me = result.name;
+    writeSessionFile(me);
     return result;
   }
 
@@ -502,7 +518,8 @@ server.tool(
     if (topics && topics.length) out += `\nsubscribed to topics: ${topics.join(", ")}`;
     if (unread) out += `\nyou have ${unread} unread message(s) — call inbox.`;
     out += `\nnotifications (recommended): arm a Monitor for clean message delivery —`;
-    out += `\nMonitor(command="node ${MONITOR_SCRIPT} --me ${assigned}", persistent=true, description="intercom messages for ${assigned}")`;
+    out += `\nMonitor(command="node ${MONITOR_SCRIPT} --server-pid ${process.pid} --me ${assigned}", persistent=true, description="intercom messages for ${assigned}")`;
+    out += `\n(--server-pid binds the watcher to THIS session, so it follows a rename; --me is the fallback.)`;
     out += `\nwhen it fires, call inbox to read. This is the delivery path — messages never type into your terminal.`;
     out += `\nalternatively (no Monitor tool): start this once as a background shell —` +
       ` \`node ${WAIT_SCRIPT} --me ${assigned}\` — it prints a line when you have mail.`;
@@ -1236,6 +1253,7 @@ process.on("exit", () => {
     // R4: don't delete — mark the identity offline. It stays addressable (messages
     // queue) and is reattached on next sign-in; pruneIdentities ages it out later.
     if (me) db.prepare("UPDATE agents SET left_at = ? WHERE name = ? AND pid = ?").run(now(), me, process.pid);
+    try { unlinkSync(sessionPath(process.pid)); } catch {}
     db.close();
   } catch {}
 });
