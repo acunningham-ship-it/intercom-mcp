@@ -93,6 +93,36 @@ await sleep(2500);
 check("legacy --me watcher still delivers", w2.read().includes(`#${idPinned}`), w2.read());
 w2.stop();
 
+// ── phantom auto-join must hand its state to the real identity ───────────────
+// A tool call before join() mints `<cwd>-<pid>`. Anything addressed to that name,
+// and anything it already read, has to follow the seat when it signs in for real —
+// otherwise the mail is stranded on a name nobody will ever read again.
+console.log("\n=== phantom auto-join hands off read-state + directed mail ===");
+const ghost = await connect("ghost");
+const whoOut = await callText(ghost, "who", {}); // pre-join tool call → phantom auto-join
+const phantom = (whoOut.match(/- (\S+) \(you\)/) || [])[1];
+check("phantom identity minted by a pre-join tool call", !!phantom, whoOut);
+
+await callText(sender, "send", { to: phantom, message: "phantom-read" });
+const readId = lastMessageId();
+await callText(ghost, "inbox", {}); // phantom reads it → reads row under the phantom name
+await callText(sender, "send", { to: phantom, message: "phantom-unread" });
+const unreadId = lastMessageId();
+
+await callText(ghost, "join", { name: "realname" });
+const ghostInbox = await callText(ghost, "inbox", {});
+check("directed mail queued to the phantom is re-pointed, not stranded",
+  ghostInbox.includes("phantom-unread"), ghostInbox);
+check("mail the phantom already read does not resurface",
+  !ghostInbox.includes("phantom-read"), ghostInbox);
+check("re-point rewrote to_agent on the phantom's directed mail",
+  peek("SELECT to_agent FROM messages WHERE id = ?", unreadId)?.to_agent === "realname",
+  JSON.stringify(peek("SELECT to_agent FROM messages WHERE id = ?", unreadId)));
+check("read-state migrated phantom → realname",
+  !!peek("SELECT 1 AS ok FROM reads WHERE agent = ? AND message_id = ?", "realname", readId),
+  "no reads row for realname");
+await ghost.close();
+
 await seat.close();
 await sender.close();
 await sleep(200);

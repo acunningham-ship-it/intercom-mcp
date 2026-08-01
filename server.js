@@ -266,6 +266,22 @@ function credentialOk(row, cwd, token) {
   return false;
 }
 
+// Carry read-state from an identity this seat is abandoning to the one it just took,
+// so the seat doesn't re-see everything it has already read. Additive: the old rows
+// stay put (an old-code seat still reading the abandoned name is unaffected).
+function migrateReads(from, to) {
+  db.prepare(
+    "INSERT OR IGNORE INTO reads (agent, message_id) SELECT ?, message_id FROM reads WHERE agent = ?"
+  ).run(to, from);
+}
+
+// Directed mail sent to a phantom auto-join name is stranded the moment the seat
+// signs in for real — nobody ever reads that name again. Re-point it at the real
+// identity. Broadcasts (to_agent IS NULL) are untouched by design.
+function repointDirected(from, to) {
+  db.prepare("UPDATE messages SET to_agent = ? WHERE to_agent = ?").run(to, from);
+}
+
 // sign_in: attach this process to the named identity, creating it if new.
 // Returns { name, status: new|rejoin|reattach|takeover, token, restored }.
 // role/topics/memory_scope/token/joined_at all persist across reboots.
@@ -349,6 +365,13 @@ function signIn(rawName, opts = {}) {
 
     // Renamed mid-session — mark our previous identity offline (durable, not deleted).
     if (me && me !== result.name) {
+      // Phantom auto-join (this process minted `<cwd>-<pid>` on a pre-join tool call and
+      // is only now signing in for real): its read-state and its directed mail belong to
+      // the real identity, otherwise both are stranded on a name nobody will ever read.
+      if (me === autoJoinedName) {
+        migrateReads(me, result.name);
+        repointDirected(me, result.name);
+      }
       db.prepare("UPDATE agents SET left_at = ? WHERE name = ? AND pid = ?").run(now(), me, process.pid);
     }
     me = result.name;
@@ -359,12 +382,17 @@ function signIn(rawName, opts = {}) {
   throw new Error("signIn: exhausted all suffix attempts");
 }
 
+// Name minted by ensureJoined() for a seat that used a tool before calling join().
+// Tracked so a later real sign-in can rescue whatever landed on the phantom name.
+let autoJoinedName = null;
+
 function ensureJoined() {
   if (me) {
     db.prepare("UPDATE agents SET last_seen = ?, left_at = NULL WHERE name = ?").run(now(), me);
     return me;
   }
-  return signIn(`${basename(process.cwd()) || "agent"}-${process.pid % 10000}`).name;
+  autoJoinedName = signIn(`${basename(process.cwd()) || "agent"}-${process.pid % 10000}`).name;
+  return autoJoinedName;
 }
 
 // ---------------------------------------------------------------------------
