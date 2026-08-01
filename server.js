@@ -217,9 +217,15 @@ function sanitizeName(name) {
   return name.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "-").slice(0, 48);
 }
 
-// Runtime dir for per-seat state (tokens, session identity files). Overridable so
-// tests stay hermetic instead of writing into the live fleet's ~/.intercom.
-const RUN_DIR = process.env.INTERCOM_RUN_DIR ?? pathJoin(homedir(), ".intercom");
+// Runtime dir for per-seat state (tokens, session identity files, watcher pidfiles).
+// Run state belongs to the bus it describes, so a caller on a NON-default DB gets its
+// own dir beside that db — that keeps tests (and any side bus) from ever writing into
+// the live fleet's ~/.intercom. monitor-watcher.js derives this identically.
+const RUN_DIR =
+  process.env.INTERCOM_RUN_DIR ??
+  (process.env.INTERCOM_DB
+    ? pathJoin(dirname(process.env.INTERCOM_DB), "run")
+    : pathJoin(homedir(), ".intercom"));
 
 // Identity binding: the seat's CURRENT resolved name, keyed by this MCP server's pid.
 // The watcher re-reads this every poll instead of trusting a static --me argv string,

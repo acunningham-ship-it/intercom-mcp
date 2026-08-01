@@ -7,7 +7,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -38,6 +38,7 @@ const peek = (sql, ...params) => {
   return row;
 };
 const lastMessageId = () => peek("SELECT MAX(id) AS id FROM messages").id;
+const safeRead = (p) => { try { return readFileSync(p, "utf8"); } catch (e) { return `<${e.code}>`; } };
 
 let failed = 0;
 const check = (label, cond, detail) => {
@@ -122,6 +123,38 @@ check("read-state migrated phantom → realname",
   !!peek("SELECT 1 AS ok FROM reads WHERE agent = ? AND message_id = ?", "realname", readId),
   "no reads row for realname");
 await ghost.close();
+
+// ── re-arming a watcher for a name retires the stale one ────────────────────
+console.log("\n=== idempotent re-arm: one watcher per identity ===");
+{
+  const first = startWatcher(["--me", "solo", "--interval", "1"]);
+  await sleep(1200);
+  const pidfile = join(RUN_DIR, "watcher-solo.pid");
+  check("watcher claims a pidfile for its identity",
+    Number(readFileSync(pidfile, "utf8").trim()) === first.proc.pid, safeRead(pidfile));
+
+  const second = startWatcher(["--me", "solo", "--interval", "1"]);
+  await sleep(1500);
+  check("re-arming for the same identity retires the stale watcher",
+    first.proc.exitCode !== null || first.proc.signalCode !== null,
+    `first exitCode=${first.proc.exitCode} signal=${first.proc.signalCode}`);
+  check("the new watcher owns the pidfile",
+    Number(readFileSync(pidfile, "utf8").trim()) === second.proc.pid, safeRead(pidfile));
+  second.stop();
+  first.stop();
+}
+
+// ── the emit names the identity it is watching ──────────────────────────────
+console.log("\n=== self-describing notification ===");
+{
+  const w3 = startWatcher(["--me", "sender", "--interval", "1"]);
+  await sleep(1200);
+  await callText(seat, "send", { to: "sender", message: "named-emit" });
+  await sleep(2500);
+  check("emit names the watched identity (mismatch is visible immediately)",
+    /\d+ new → sender:/.test(w3.read()), w3.read());
+  w3.stop();
+}
 
 await seat.close();
 await sender.close();

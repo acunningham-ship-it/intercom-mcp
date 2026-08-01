@@ -17,16 +17,16 @@
 // watch an identity its seat doesn't own. --me alone behaves exactly as before.
 //
 // Each line format:
-//   [<timestamp>] [<kind>] <count> new from <agents>
-//   e.g. [14:23:45] [message] 3 new: claude-boss (#1), worker-2 (#2-3)
+//   [<timestamp>] [<kind>] <count> new → <watched identity>: <senders>
+//   e.g. [14:23:45] [message] 3 new → dex: claude-boss (#1), worker-2 (#2-3)
 //
 // Emits one line per polling cycle (even if multiple messages arrive together).
 // Each emission includes ALL unread messages in that cycle, grouped by sender.
 
 import { DatabaseSync } from "node:sqlite";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join as pathJoin } from "node:path";
+import { dirname, join as pathJoin } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { unreadFor } from "./unread.js";
 
@@ -63,9 +63,14 @@ const DB_PATH =
   process.env.INTERCOM_DB ??
   pathJoin(homedir(), ".local", "share", "intercom", "intercom.db");
 
-// Runtime dir shared with server.js (session identity files). Env-overridable so
-// tests never touch the live fleet's ~/.intercom.
-const RUN_DIR = process.env.INTERCOM_RUN_DIR ?? pathJoin(homedir(), ".intercom");
+// Runtime dir shared with server.js (session identity files, watcher pidfiles).
+// Derived identically there: beside a non-default db, else ~/.intercom. That's what
+// stops a test watcher from ever SIGTERM-ing a live fleet watcher of the same name.
+const RUN_DIR =
+  process.env.INTERCOM_RUN_DIR ??
+  (process.env.INTERCOM_DB
+    ? pathJoin(dirname(process.env.INTERCOM_DB), "run")
+    : pathJoin(homedir(), ".intercom"));
 const SESSION_FILE = serverPid ? pathJoin(RUN_DIR, "session", String(serverPid)) : null;
 
 let db = null;
@@ -134,6 +139,48 @@ function getUnread() {
   }
 }
 
+// One watcher per identity. Arming a new watcher for a name retires the stale one
+// instead of stacking a second poller on the same inbox (which is how a name ends up
+// with two watchers, one of them on a 600s interval, silently swallowing delivery).
+const pidfilePath = (name) => pathJoin(RUN_DIR, `watcher-${name}.pid`);
+let armedName = null;
+
+// Only ever signal something that is actually a monitor-watcher — a recycled pid must
+// never be killed on the strength of a stale pidfile.
+function isWatcherProcess(pid) {
+  try {
+    return readFileSync(`/proc/${pid}/cmdline`, "utf8").includes("monitor-watcher");
+  } catch {
+    return false;
+  }
+}
+
+function releasePidfile() {
+  if (!armedName) return;
+  try {
+    if (Number(readFileSync(pidfilePath(armedName), "utf8").trim()) === process.pid) {
+      unlinkSync(pidfilePath(armedName));
+    }
+  } catch {}
+  armedName = null;
+}
+
+function armPidfile(name) {
+  if (!name || name === armedName) return;
+  releasePidfile();
+  try {
+    const prev = Number(readFileSync(pidfilePath(name), "utf8").trim());
+    if (prev && prev !== process.pid && pidAlive(prev) && isWatcherProcess(prev)) {
+      try { process.kill(prev, "SIGTERM"); } catch {}
+    }
+  } catch {}
+  try {
+    mkdirSync(RUN_DIR, { recursive: true });
+    writeFileSync(pidfilePath(name), String(process.pid));
+    armedName = name;
+  } catch {}
+}
+
 function formatTimestamp() {
   const d = new Date();
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
@@ -162,13 +209,16 @@ function formatSenders(groups) {
 }
 
 for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => {
+  releasePidfile();
   closeDb();
   process.exit(0);
 });
+process.on("exit", releasePidfile);
 
 // Main loop: poll and emit on changes
 while (true) {
   me = resolveMe();
+  armPidfile(me);
   const messages = getUnread();
   const fresh = messages.filter((m) => !lastSeen.has(m.id));
 
@@ -180,9 +230,11 @@ while (true) {
     const kinds = [...new Set(fresh.map((m) => m.kind))].sort().join("/");
     const ts = formatTimestamp();
 
-    // Single-line emit: timestamp, kind, count, senders
+    // Single-line emit: timestamp, kind, count, WHO IT'S FOR, senders. Naming the
+    // watched identity makes a binding mismatch visible on the first notification
+    // instead of after a day of mail landing on the wrong name.
     console.log(
-      `[${ts}] [${kinds}] ${fresh.length} new: ${senderList}`
+      `[${ts}] [${kinds}] ${fresh.length} new → ${me}: ${senderList}`
     );
 
     // Flush stdout so Monitor sees it immediately
