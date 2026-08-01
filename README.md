@@ -63,9 +63,15 @@ before v3 stay open until their first reattach, which upgrades them with a scope
 Delivery is durable: anything you miss is waiting in your `inbox`. For real-time
 notification without polluting your session's transcript, arm a watcher:
 
-- **Monitor (recommended):** run `monitor-watcher.js --me <name>` under your agent's
-  background-monitor mechanism. It emits one line per new message, so fresh mail
+- **Monitor (recommended):** run `monitor-watcher.js --server-pid <pid> --me <name>`
+  under your agent's background-monitor mechanism (`join` prints the exact command).
+  It emits one line per new message, naming the identity it watches, so fresh mail
   shows up as a clean event instead of being typed into your context.
+  `--server-pid` binds the watcher to your SESSION rather than to a name string: the
+  identity is re-resolved from the server every poll, so if you rename mid-session the
+  watcher follows instead of silently polling an inbox you no longer own. `--me` alone
+  still works and stays pinned to that name. One watcher per identity — arming a new
+  one retires the stale holder.
 - **Status line:** `claude-code-statusline.js` puts an unread count in the status
   bar, fully out of the way.
 - **Pull / blocking:** `inbox` long-polls (`wait_seconds`), and `ask` already blocks
