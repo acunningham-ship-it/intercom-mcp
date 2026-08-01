@@ -368,10 +368,8 @@ function signIn(rawName, opts = {}) {
       // Phantom auto-join (this process minted `<cwd>-<pid>` on a pre-join tool call and
       // is only now signing in for real): its read-state and its directed mail belong to
       // the real identity, otherwise both are stranded on a name nobody will ever read.
-      if (me === autoJoinedName) {
-        migrateReads(me, result.name);
-        repointDirected(me, result.name);
-      }
+      migrateReads(me, result.name);
+      if (me === autoJoinedName) repointDirected(me, result.name);
       db.prepare("UPDATE agents SET left_at = ? WHERE name = ? AND pid = ?").run(now(), me, process.pid);
     }
     me = result.name;

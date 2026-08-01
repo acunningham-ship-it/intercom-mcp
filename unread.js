@@ -13,13 +13,25 @@
 // R3 TTL: an expired message (expires_at in the past) is excluded from unread — a
 // time-sensitive message that missed its window shouldn't nag. It's still in the db
 // (history/get_message show it tagged [STALE]); it just stops counting as unread.
+//
+// Join-time floor (BROADCASTS ONLY): a brand-new identity doesn't inherit the fleet's
+// entire broadcast backlog — broadcasts older than its joined_at don't count as unread.
+// joined_at is durable (reattach/takeover keep the original), so a returning identity
+// still gets everything it missed while offline.
+// ⛔ DIRECTED messages (to_agent = me) are deliberately NOT floored: mail queued for an
+// identity before it signed in is the whole point of durable delivery, and re-pointed
+// mail (phantom → real name) is by definition older than the real identity's joined_at.
+// COALESCE('') keeps callers with no agents row (a watcher on a name that never joined)
+// seeing everything, as before.
 export function unreadFor(db, agent, { from, topic, type } = {}) {
   let sql = `SELECT m.* FROM messages m
     WHERE m.from_agent != ?
       AND (m.to_agent = ? OR m.to_agent IS NULL)
       AND m.kind != 'response'
-      AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.agent = ? AND r.message_id = m.id)`;
-  const params = [agent, agent, agent];
+      AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.agent = ? AND r.message_id = m.id)
+      AND (m.to_agent IS NOT NULL
+           OR m.created_at >= COALESCE((SELECT joined_at FROM agents WHERE name = ?), ''))`;
+  const params = [agent, agent, agent, agent];
 
   if (from) { sql += ` AND m.from_agent = ?`; params.push(from); }
   if (topic) { sql += ` AND m.topic = ?`; params.push(topic); }

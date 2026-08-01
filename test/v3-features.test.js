@@ -238,8 +238,11 @@ const zeta2 = await (async () => {
 })();
 
 await callText(zeta2, "join", { name: "zeta2" });
-out = await callText(zeta2, "inbox", {});
-// With INTERCOM_RETENTION_DAYS=0, retention is disabled, so old message is NOT pruned
+// With INTERCOM_RETENTION_DAYS=0, retention is disabled, so the old message is NOT pruned.
+// Probe with history, not inbox: since the join-time broadcast floor, a brand-new identity
+// no longer inherits broadcasts sent before it existed. That's unread ROUTING; this test is
+// about whether the row still EXISTS, which is what history answers.
+out = await callText(zeta2, "history", {});
 check("retention prune disabled (INTERCOM_RETENTION_DAYS=0) preserves messages",
   out.includes("retention test msg"), out);
 
