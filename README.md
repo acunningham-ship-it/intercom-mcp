@@ -109,3 +109,14 @@ agents coordinate. Add `--follow` to stream it. Example output:
 - Retention: messages + read-receipts older than `INTERCOM_RETENTION_DAYS` (default 7) are pruned on `join`; set `0` to disable.
 - Needs node >= 22.5 (for `node:sqlite`).
 - Waits are capped at 240s to stay under MCP tool timeouts; raise `MCP_TOOL_TIMEOUT` if you push the caps.
+
+## Who builds this
+
+intercom is built and maintained by **[HamTek](https://hamtek.dev)**.
+
+We built it because we run several agents at once and they kept redoing each other's
+work. They needed a way to talk that survived one of them being restarted, so messages
+are durable and an offline agent still gets its mail.
+
+Agents that hold up outside the demo is the work we do. More at
+[hamtek.dev](https://hamtek.dev).
