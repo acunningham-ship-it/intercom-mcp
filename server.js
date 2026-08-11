@@ -390,10 +390,42 @@ function signIn(rawName, opts = {}) {
 // Tracked so a later real sign-in can rescue whatever landed on the phantom name.
 let autoJoinedName = null;
 
+// Set by ensureJoined() when it has something the caller needs to see (a skipped
+// reattach, an ambiguous cwd match). Consumed once by text() and cleared — see there.
+let pendingWarning = null;
+
 function ensureJoined() {
   if (me) {
     db.prepare("UPDATE agents SET last_seen = ?, left_at = NULL WHERE name = ?").run(now(), me);
     return me;
+  }
+  // Before minting a generic sibling name, check whether a durable identity already
+  // claims this exact cwd — credentialOk()'s own reattach check (line ~269), just run
+  // one step earlier so a resumed session finds its OWN identity instead of forking a
+  // new one. Only acts on an UNAMBIGUOUS, OFFLINE match; anything else falls through to
+  // the pre-existing auto-provision behavior, now with a loud warning instead of silence.
+  const cwd = process.cwd();
+  const scopeMatches = db.prepare("SELECT * FROM agents WHERE memory_scope = ?").all(cwd);
+  if (scopeMatches.length === 1 && !agentAlive(scopeMatches[0])) {
+    const result = signIn(scopeMatches[0].name);
+    autoJoinedName = null; // real reattach, not a phantom auto-join
+    return result.name;
+  }
+  if (scopeMatches.length === 1) {
+    // Exactly one match, but it's LIVE under a different pid right now — takeover
+    // semantics exist for a reason (signIn's own live-holder branch); don't route
+    // around them here by seizing it silently.
+    pendingWarning = `no identity yet this process — cwd matches "${scopeMatches[0].name}", ` +
+      `but it's currently online elsewhere, so not auto-reattaching. Provisioned a generic ` +
+      `name instead; call join("${scopeMatches[0].name}", {takeover:true}) if that's you.`;
+  } else if (scopeMatches.length > 1) {
+    const names = scopeMatches.map((r) => r.name).join(", ");
+    pendingWarning = `no identity yet this process — cwd matches ${scopeMatches.length} durable ` +
+      `identities (${names}); ambiguous, not guessing. Provisioned a generic name instead; call ` +
+      `join("<name>") explicitly if one of those is you.`;
+  } else {
+    pendingWarning = `no identity yet this process and no existing identity matches this cwd — ` +
+      `provisioned a generic name. Call join("yourname") if you meant to attach to something durable.`;
   }
   autoJoinedName = signIn(`${basename(process.cwd()) || "agent"}-${process.pid % 10000}`).name;
   return autoJoinedName;
@@ -466,7 +498,17 @@ function fmtMessage(m) {
   return line;
 }
 
-const text = (s) => ({ content: [{ type: "text", text: s }] });
+// Every tool response funnels through here (45 call sites, no bypass) — the one shared
+// hook point, so a pending ensureJoined() warning reaches the caller without touching
+// every individual handler. Consumed once: fires on the first tool call after it's set,
+// then clears, so it surfaces exactly once per auto-provision rather than on every call.
+const text = (s) => {
+  if (pendingWarning) {
+    s = `⚠️ ${pendingWarning}\n\n${s}`;
+    pendingWarning = null;
+  }
+  return { content: [{ type: "text", text: s }] };
+};
 
 // ---------------------------------------------------------------------------
 // server & tools
